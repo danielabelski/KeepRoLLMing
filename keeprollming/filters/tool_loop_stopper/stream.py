@@ -5,10 +5,10 @@ Detects tool-loop patterns in streaming output and produces a
 ``merge_strategy="inject_tool_result"`` so the runner can inject a
 tool-result message and break the loop.
 
-**Observer semantics:** TLSFinalizer copies ToolCallDelta/ToolCallComplete
-events into its internal buffer for detection but **returns the original
-event** (not ``[]``). It does NOT own ToolCallComplete assembly and does
-NOT interfere with ToolCallFinalizer or I9.
+**Delivery semantics:** the default and heuristic modes observe tool-call
+events without consuming them.  Exact-only progressive mode may hold an
+ambiguous call and commit a call whose name is already provably distinct.  It
+still does NOT own ToolCallComplete assembly or direct SSE writes.
 
 This module is **independent** of the previous pipeline and can be unit-tested
 in isolation.
@@ -152,10 +152,11 @@ def _build_user_nudge_message(tool_name: str) -> Dict[str, Any]:
 class TLSFinalizer(StreamFinalizer):
     """Detect tool-loop patterns and produce intervention recovery decisions.
 
-    **Observer semantics:**
-    - ToolCallDelta / ToolCallComplete events are copied into the TLS buffer
-      for detection purposes.
-    - The original event is **always returned** (``[event]``), never consumed.
+    **Delivery semantics:**
+    - Default, fuzzy, and AB-loop modes copy ToolCallDelta / ToolCallComplete
+      events for detection and return the original event unchanged.
+    - Exact progressive mode holds only a call whose duplicate status is still
+      ambiguous; a distinct call is released immediately.
     - Does NOT own ToolCallComplete assembly (ToolCallFinalizer does).
     - Does NOT interfere with I9 invariant.
 
@@ -174,7 +175,8 @@ class TLSFinalizer(StreamFinalizer):
 
     **On no loop:**
     - ``decision`` is ``None``.
-    - No output mutation — original events pass through unchanged.
+    - No output mutation in observer modes; progressive exact mode may release
+      terminally resolved held calls.
 
     **Max attempts:**
     - If ``attempt_index >= max_attempts``, the finalizer does NOT produce
@@ -210,6 +212,7 @@ class TLSFinalizer(StreamFinalizer):
         max_attempts: int = 3,
         fuzzy_threshold: Optional[float] = None,
         detect_ab_loop: bool = False,
+        progressive_exact: bool = False,
         tls_message: str = (
             "Tool result: please provide a direct answer without "
             "calling tools."
@@ -224,6 +227,13 @@ class TLSFinalizer(StreamFinalizer):
         self.max_attempts = max_attempts
         self.fuzzy_threshold = fuzzy_threshold
         self.detect_ab_loop = detect_ab_loop
+        # Prefix decisions are sound only for exact consecutive matching.
+        # Fuzzy and AB policies need a separate proof over the full sequence.
+        self.progressive_exact = (
+            progressive_exact
+            and fuzzy_threshold is None
+            and not detect_ab_loop
+        )
         self.tls_message = tls_message
         self.nudge_message = nudge_message
         self.fallback_message = fallback_message
@@ -238,6 +248,9 @@ class TLSFinalizer(StreamFinalizer):
         self._attempt_index = 0
         self._history_tool_events = tuple(conversation_tool_calls or ())
         self._restore_conversation_history()
+        self._progressive_calls: Dict[int, Dict[str, Any]] = {}
+        self._progressive_last_name = self._last_history_name()
+        self._progressive_committed = False
 
     # ── StreamFinalizer contract ──────────────────────────────────
 
@@ -258,6 +271,7 @@ class TLSFinalizer(StreamFinalizer):
         self._tool_call_ids.clear()
         self._tool_names.clear()
         self._restore_conversation_history()
+        self._reset_progressive_state()
         self._has_tool_call = False
         self._decision = None
         self._finalized = False
@@ -282,6 +296,41 @@ class TLSFinalizer(StreamFinalizer):
             )
             self._buffer_tool_event(event)
 
+    def _last_history_name(self) -> Optional[str]:
+        """Return the latest usable conversation tool name."""
+        for tool_call in reversed(self._history_tool_events):
+            function = tool_call.get("function")
+            if isinstance(function, Mapping) and isinstance(function.get("name"), str):
+                return function["name"]
+        return None
+
+    def _last_history_signature(self) -> Optional[str]:
+        """Return the latest complete conversation signature for exact TLS."""
+        for tool_call in reversed(self._history_tool_events):
+            function = tool_call.get("function")
+            if not isinstance(function, Mapping):
+                continue
+            name = function.get("name")
+            arguments = function.get("arguments", "")
+            if not isinstance(name, str) or not isinstance(arguments, str):
+                continue
+            signature = _tool_call_signature(
+                ToolCallComplete(
+                    index=int(tool_call.get("index", 0)),
+                    id=str(tool_call.get("id", "")),
+                    name=name,
+                    arguments_json=arguments,
+                )
+            )
+            if signature is not None:
+                return signature
+        return None
+
+    def _reset_progressive_state(self) -> None:
+        self._progressive_calls.clear()
+        self._progressive_last_name = self._last_history_name()
+        self._progressive_committed = False
+
     def process_event(self, event: StreamEvent) -> list[StreamEvent]:
         """Process a single StreamEvent.
 
@@ -292,6 +341,9 @@ class TLSFinalizer(StreamFinalizer):
 
         Never returns ``[]`` — TLSFinalizer is an observer, not a consumer.
         """
+        if self.progressive_exact and isinstance(event, ToolCallDelta):
+            return self._process_progressive_delta(event)
+
         if isinstance(event, (ToolCallDelta, ToolCallComplete)):
             self._buffer_tool_event(event)
             self._has_tool_call = True
@@ -321,6 +373,9 @@ class TLSFinalizer(StreamFinalizer):
         if self._finalized:
             raise RuntimeError("TLSFinalizer.finalize() already called")
         self._finalized = True
+
+        if self.progressive_exact:
+            return self._finalize_progressive_exact(global_attempt_index)
 
         # Check for loops
         if self._detect_loop():
@@ -366,7 +421,145 @@ class TLSFinalizer(StreamFinalizer):
         """The buffered tool signatures (for test inspection)."""
         return list(self._tool_signatures)
 
+    @property
+    def allows_live_output(self) -> bool:
+        """Whether this TLS policy supports irreversible live SSE output."""
+        return self.progressive_exact
+
     # ── Internal helpers ──────────────────────────────────────────
+
+    def _process_progressive_delta(
+        self, event: ToolCallDelta
+    ) -> list[StreamEvent]:
+        """Gate one exact-mode call without delaying distinct function names."""
+        self._has_tool_call = True
+        call = self._progressive_calls.setdefault(
+            event.index,
+            {
+                "id": event.id,
+                "name": event.name,
+                "args": [],
+                "events": [],
+                "state": "pending",
+            },
+        )
+        if event.id and not call["id"]:
+            call["id"] = event.id
+        if event.name and not call["name"]:
+            call["name"] = event.name
+        if event.arguments_delta:
+            call["args"].append(event.arguments_delta)
+        call["events"].append(event)
+
+        if call["state"] == "accepted":
+            self._progressive_committed = True
+            return [event]
+        if call["state"] == "rejected":
+            return []
+
+        name = call["name"]
+        if name is None:
+            return []
+
+        # Do not overtake an earlier unresolved tool-call index.
+        if any(
+            earlier < event.index and current["state"] == "pending"
+            for earlier, current in self._progressive_calls.items()
+        ):
+            return []
+
+        if self._progressive_last_name is None or name != self._progressive_last_name:
+            call["state"] = "accepted"
+            self._progressive_last_name = name
+            self._progressive_committed = True
+            return list(call["events"])
+
+        return []
+
+    def _progressive_signature(self, call: Mapping[str, Any]) -> Optional[str]:
+        name = call.get("name")
+        if not isinstance(name, str):
+            return None
+        arguments_json = "".join(call.get("args", []))
+        try:
+            arguments_obj = json.loads(arguments_json)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        return f"{name}::{_canonical_json(arguments_obj)}"
+
+    def _finalize_progressive_exact(
+        self, global_attempt_index: int,
+    ) -> list[StreamEvent]:
+        """Resolve held same-name calls at the terminal barrier."""
+        released: list[StreamEvent] = []
+        duplicate: Mapping[str, Any] | None = None
+        prior_signature = self._last_history_signature()
+
+        for index in sorted(self._progressive_calls):
+            call = self._progressive_calls[index]
+            signature = self._progressive_signature(call)
+            if signature is None:
+                call["state"] = "rejected"
+                continue
+
+            is_duplicate = prior_signature is not None and signature == prior_signature
+            if is_duplicate:
+                call["state"] = "rejected"
+                duplicate = call
+            else:
+                if call["state"] == "pending":
+                    call["state"] = "accepted"
+                    released.extend(call["events"])
+                prior_signature = signature
+
+        # Once a call has been sent, the former whole-attempt recovery would
+        # contradict irreversible downstream output. Keep accepted calls and
+        # drop only the pending duplicate; the next client tool turn resumes
+        # normal TLS protection.
+        if duplicate is not None and not self._progressive_committed:
+            if self._attempt_index < self.max_attempts:
+                self._decision = self._build_progressive_recovery_decision(
+                    duplicate,
+                    global_attempt_index,
+                )
+                return []
+
+        self._decision = None
+        return released
+
+    def _build_progressive_recovery_decision(
+        self,
+        duplicate: Mapping[str, Any],
+        global_attempt_index: int,
+    ) -> RecoveryDecision:
+        name = str(duplicate.get("name") or "tool")
+        tool_call_id = str(duplicate.get("id") or "unknown_tool_call_id")
+        return RecoveryDecision(
+            kind="intervention",
+            reason=(
+                f"Tool-loop detected: repeated call to '{name}'. "
+                "Injecting tool result to break the loop."
+            ),
+            priority=self.priority,
+            origin_finalizer="TLSFinalizer",
+            attempt_index=self._attempt_index,
+            max_attempts=self.max_attempts,
+            global_attempt_index=global_attempt_index,
+            request_payload_patch={
+                "messages": [
+                    _build_tool_result_message(name, tool_call_id, self.tls_message),
+                    _build_user_nudge_message(name),
+                ],
+            },
+            preserve_output_so_far=True,
+            merge_strategy="inject_tool_result",
+            diagnostics={
+                "loop_type": "exact_consecutive",
+                "tool_name": name,
+                "tool_call_id": tool_call_id,
+                "delivery": "terminal_buffered",
+            },
+        )
 
     def _buffer_tool_event(self, event: StreamEvent) -> None:
         """Buffer a tool call event for loop detection.

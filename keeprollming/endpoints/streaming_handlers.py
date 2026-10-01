@@ -13,6 +13,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Set
 import httpx
 
 from ..logger import log
+from ..observability import events_execution as _exec
 from ..routing import Route
 from ..streaming.tool_call_handler import ToolCallAccumulator
 from ..upstream import make_request_timeout
@@ -65,6 +66,51 @@ _MIN_DECODE_TOKENS_ESTIMATE = 8
 _MIN_DECODE_WINDOW_SECONDS = 0.1
 
 
+class _UpstreamStreamError(RuntimeError):
+    """An HTTP error received before an upstream SSE stream can begin."""
+
+    def __init__(self, status_code: int, error_body: str) -> None:
+        self.status_code = status_code
+        self.error_body = error_body
+        super().__init__(f"Upstream returned HTTP {status_code}: {error_body}")
+
+
+def _upstream_error_sse_payload(status_code: int, error_body: str) -> dict[str, Any]:
+    """Return an OpenAI-compatible SSE error, preserving an upstream envelope.
+
+    A streaming response has already committed its HTTP headers when the
+    upstream status is known. The only standards-compatible way to report a
+    non-2xx upstream response at that point is an SSE ``error`` event. Keep
+    a valid upstream OpenAI error object intact; normalize other bodies into
+    the same shape.
+    """
+    try:
+        parsed = json.loads(error_body)
+    except (TypeError, ValueError):
+        parsed = None
+    if isinstance(parsed, dict) and isinstance(parsed.get("error"), dict):
+        return parsed
+    return {
+        "error": {
+            "message": error_body or f"Upstream returned HTTP {status_code}",
+            "type": "upstream_error",
+            "code": status_code,
+        }
+    }
+
+
+def _is_terminal_client_http_error(status_code: int) -> bool:
+    """Whether an upstream HTTP status represents an invalid client request.
+
+    A fallback route cannot make a malformed or over-budget request valid. In
+    particular, vLLM reports context-window overflow as HTTP 400. Retrying it
+    against another configured model hides the real cause and wastes capacity.
+    Keep 404 retryable: it is commonly a model/endpoint availability mismatch
+    that a fallback route is specifically intended to recover from.
+    """
+    return status_code == 400
+
+
 class _StreamTranscript:
     """Accumulate the client-visible semantic result of a streamed response."""
 
@@ -95,8 +141,11 @@ class _StreamTranscript:
                 self.usage = event["usage"]
             if isinstance(delta.get("content"), str):
                 self.content.append(delta["content"])
-            if isinstance(delta.get("reasoning_content"), str):
-                self.reasoning.append(delta["reasoning_content"])
+            reasoning = delta.get("reasoning_content")
+            if not isinstance(reasoning, str):
+                reasoning = delta.get("reasoning")
+            if isinstance(reasoning, str):
+                self.reasoning.append(reasoning)
             self.tool_calls.add_delta(delta)
             if isinstance(choice.get("finish_reason"), str):
                 self.finish_reason = choice["finish_reason"]
@@ -160,7 +209,7 @@ class _StreamProgress:
             for choice in choices:
                 delta = choice.get("delta", {}) or {}
                 generated_chars = 0
-                for field in ("content", "reasoning_content"):
+                for field in ("content", "reasoning_content", "reasoning"):
                     value = delta.get(field)
                     if isinstance(value, str):
                         generated_chars += len(value)
@@ -359,8 +408,8 @@ async def process_streaming_request(
     route: Route,
     req_id: str,
     request_timeout: float,
-    fallback_attempts: List[Dict[str, str]],
-    visited_models: Set[str],
+    fallback_attempts: Sequence[Any],
+    visited_models: Set[str] | None,  # legacy caller compatibility
     upstream_model: str,
     is_passthrough: bool,
     transform_reasoning_content: bool,
@@ -371,6 +420,8 @@ async def process_streaming_request(
     dispatcher: Any = None,
     pipeline: Any = None,
     enabled_filters: Sequence[str] | None = None,
+    on_upstream_success: Any = None,
+    on_upstream_failure: Any = None,
 ) -> AsyncIterator[bytes]:
     """Process a streaming chat completion request via filter chain.
 
@@ -444,79 +495,166 @@ async def process_streaming_request(
 
     # Build upstream async generator
     async def upstream_stream(upstream_payload):
-        emit_upstream_connect(
-            req_id=req_id,
-            url=url[:80],
-            dispatcher=dispatcher,
-        )
         chunk_count = 0
         close_reason = "unknown"
-        connected_at: float | None = None
-        first_chunk_seen = False
+        primary_attempt = {
+            "route": getattr(route, "name", ""),
+            "model": upstream_model,
+            "endpoint_url": url,
+            "request_timeout": request_timeout,
+        }
+        attempts: list[Any] = [primary_attempt, *fallback_attempts[1:]]
+        total_attempts = len(attempts)
         try:
-            emit_trace_lifecycle(
-                req_id,
-                boundary="upstream.connect_started",
-                dispatcher=dispatcher,
-                url=url[:200],
-                method="POST",
-            )
-            async with client.stream(
-                "POST",
-                url,
-                json=upstream_payload,
-                headers=route_headers,
-                timeout=make_request_timeout(request_timeout),
-            ) as resp:
-                connected_at = time.perf_counter()
+            for index, attempt in enumerate(attempts):
+                if isinstance(attempt, dict):
+                    attempt_url = str(attempt.get("endpoint_url") or attempt.get("url") or "")
+                    attempt_headers = dict(attempt.get("upstream_headers") or route_headers)
+                    attempt_timeout = float(attempt.get("request_timeout") or request_timeout)
+                    attempt_model = str(attempt.get("model") or upstream_model)
+                else:
+                    attempt_url = attempt.endpoint_url
+                    attempt_headers = dict(attempt.upstream_headers)
+                    attempt_timeout = attempt.request_timeout
+                    attempt_model = attempt.model
+                first_chunk_seen = False
+                connected_at: float | None = None
+                attempt_payload = dict(upstream_payload)
+                attempt_payload["model"] = attempt_model
+                emit_upstream_connect(req_id=req_id, url=attempt_url[:80], dispatcher=dispatcher)
+                emit_trace_lifecycle(
+                    req_id, boundary="upstream.connect_started", dispatcher=dispatcher,
+                    url=attempt_url[:200], method="POST", attempt=index + 1,
+                    model=attempt_model,
+                )
+                try:
+                    async with client.stream(
+                        "POST", attempt_url, json=attempt_payload,
+                        headers=attempt_headers,
+                        timeout=make_request_timeout(attempt_timeout),
+                    ) as resp:
+                        connected_at = time.perf_counter()
                 # Exact socket metadata is optional diagnostics. Lightweight
                 # response doubles and non-httpx transports need not expose
                 # the httpx extensions mapping.
-                response_extensions = getattr(resp, "extensions", {}) or {}
-                network_stream = response_extensions.get("network_stream")
-                get_extra_info = getattr(network_stream, "get_extra_info", None)
-                peer = get_extra_info("peername") if callable(get_extra_info) else None
-                sockname = get_extra_info("sockname") if callable(get_extra_info) else None
-                emit_trace_lifecycle(
-                    req_id,
-                    boundary="upstream.response_headers",
-                    dispatcher=dispatcher,
-                    status=resp.status_code,
-                    peer=str(peer) if peer is not None else None,
-                    local_socket=str(sockname) if sockname is not None else None,
-                    content_type=resp.headers.get("content-type"),
-                )
-                emit_upstream_connected(
-                    req_id=req_id,
-                    status=resp.status_code,
-                    dispatcher=dispatcher,
-                )
-                async for chunk in resp.aiter_bytes():
-                    chunk_count += 1
-                    if not first_chunk_seen:
-                        first_chunk_seen = True
+                        response_extensions = getattr(resp, "extensions", {}) or {}
+                        network_stream = response_extensions.get("network_stream")
+                        get_extra_info = getattr(network_stream, "get_extra_info", None)
+                        peer = get_extra_info("peername") if callable(get_extra_info) else None
+                        sockname = get_extra_info("sockname") if callable(get_extra_info) else None
                         emit_trace_lifecycle(
-                            req_id,
-                            boundary="upstream.first_chunk",
-                            dispatcher=dispatcher,
-                            chunk_bytes=len(chunk),
-                            after_headers_ms=round((time.perf_counter() - connected_at) * 1000.0, 3)
-                            if connected_at is not None
-                            else None,
+                            req_id, boundary="upstream.response_headers", dispatcher=dispatcher,
+                            status=resp.status_code, peer=str(peer) if peer is not None else None,
+                            local_socket=str(sockname) if sockname is not None else None,
+                            content_type=resp.headers.get("content-type"), attempt=index + 1,
                         )
-                    emit_trace_chunk(
-                        req_id,
-                        direction="upstream",
-                        boundary="upstream.received",
-                        chunk_index=chunk_count,
-                        raw_bytes=chunk,
-                        started_monotonic_ns=trace_started_ns,
+                        emit_upstream_connected(req_id=req_id, status=resp.status_code, dispatcher=dispatcher)
+                        if resp.status_code >= 400:
+                            error_bytes = await resp.aread()
+                            error_body = error_bytes.decode("utf-8", errors="replace")
+                            # A later fallback can hide this response from the
+                            # client, but the selected raw trace must retain
+                            # the exact upstream error bytes for diagnosis.
+                            emit_trace_chunk(
+                                req_id, direction="upstream", boundary="upstream.error_body",
+                                chunk_index=0, raw_bytes=error_bytes,
+                                started_monotonic_ns=trace_started_ns, dispatcher=dispatcher,
+                            )
+                            emit_trace_lifecycle(
+                                req_id, boundary="upstream.error_body_received",
+                                dispatcher=dispatcher, status=resp.status_code,
+                                body_bytes=len(error_bytes), attempt=index + 1,
+                            )
+                            if (
+                                not _is_terminal_client_http_error(resp.status_code)
+                                and index + 1 < total_attempts
+                            ):
+                                successor = attempts[index + 1]
+                                _exec.emit_upstream_error(
+                                    req_id, resp.status_code, attempt_url,
+                                    getattr(route, "name", "?"), attempt_model, error_body,
+                                    request_payload=attempt_payload, recovered=True,
+                                    attempt=index + 1, total_attempts=total_attempts,
+                                    dispatcher=dispatcher,
+                                )
+                                _exec.emit_fallback(
+                                    req_id, attempt, successor,
+                                    reason="http_status", attempt=index + 1,
+                                    total_attempts=total_attempts, status=resp.status_code,
+                                    error=error_body,
+                                    dispatcher=dispatcher,
+                                )
+                                source = _exec.describe_fallback_attempt(attempt, index + 1)
+                                target = _exec.describe_fallback_attempt(successor, index + 2)
+                                emit_trace_lifecycle(
+                                    req_id, boundary="upstream.fallback_scheduled",
+                                    dispatcher=dispatcher, reason="http_status",
+                                    status=resp.status_code, attempt=index + 1,
+                                    total_attempts=total_attempts,
+                                    from_route=source["route"], from_model=source["model"],
+                                    from_url=source["upstream_url"], to_route=target["route"],
+                                    to_model=target["model"], to_url=target["upstream_url"],
+                                )
+                                continue
+                    # Mirror the non-streaming path: capture the complete
+                    # upstream failure before handing a semantic SSE error to
+                    # the client. The formatter may truncate its projection;
+                    # body capture retains the original body when enabled.
+                            _exec.emit_upstream_error(
+                                req_id, resp.status_code, attempt_url,
+                                getattr(route, "name", "?"), attempt_model, error_body,
+                                request_payload=attempt_payload, dispatcher=dispatcher,
+                            )
+                            raise _UpstreamStreamError(resp.status_code, error_body)
+                        async for chunk in resp.aiter_bytes():
+                            chunk_count += 1
+                            if not first_chunk_seen:
+                                first_chunk_seen = True
+                                emit_trace_lifecycle(
+                                    req_id, boundary="upstream.first_chunk", dispatcher=dispatcher,
+                                    chunk_bytes=len(chunk),
+                                    after_headers_ms=round((time.perf_counter() - connected_at) * 1000.0, 3)
+                                    if connected_at is not None else None,
+                                    attempt=index + 1,
+                                )
+                            emit_trace_chunk(req_id, direction="upstream", boundary="upstream.received",
+                                             chunk_index=chunk_count, raw_bytes=chunk,
+                                             started_monotonic_ns=trace_started_ns, dispatcher=dispatcher)
+                            progress.observe_upstream(chunk)
+                            progress.emit_if_due(req_id, dispatcher=dispatcher)
+                            yield chunk
+                        close_reason = "normal"
+                        return
+                except (GeneratorExit, asyncio.CancelledError):
+                    raise
+                except _UpstreamStreamError:
+                    # The upstream answered successfully at HTTP level with a
+                    # terminal client error. Do not reinterpret it as a
+                    # transport failure and retry a fallback target.
+                    raise
+                except Exception as exc:
+                    if first_chunk_seen or index + 1 >= total_attempts:
+                        raise
+                    successor = attempts[index + 1]
+                    _exec.emit_fallback(
+                        req_id, attempt, successor,
+                        reason="timeout" if isinstance(exc, httpx.TimeoutException) else "transport_error",
+                        attempt=index + 1, total_attempts=total_attempts,
+                        error_type=type(exc).__name__, error=str(exc),
                         dispatcher=dispatcher,
                     )
-                    progress.observe_upstream(chunk)
-                    progress.emit_if_due(req_id, dispatcher=dispatcher)
-                    yield chunk
-                close_reason = "normal"
+                    source = _exec.describe_fallback_attempt(attempt, index + 1)
+                    target = _exec.describe_fallback_attempt(successor, index + 2)
+                    emit_trace_lifecycle(
+                        req_id, boundary="upstream.fallback_scheduled", dispatcher=dispatcher,
+                        reason="timeout" if isinstance(exc, httpx.TimeoutException) else "transport_error",
+                        from_url=source["upstream_url"], to_url=target["upstream_url"],
+                        from_route=source["route"], from_model=source["model"],
+                        to_route=target["route"], to_model=target["model"],
+                        error_type=type(exc).__name__, error=str(exc)[:1000],
+                        attempt=index + 1, total_attempts=total_attempts,
+                    )
+                    continue
         except GeneratorExit:
             close_reason = "generator_exit"
             raise
@@ -620,6 +758,8 @@ async def process_streaming_request(
         )
         return
     except Exception as e:
+        if on_upstream_failure is not None:
+            on_upstream_failure()
         # O11: include route/upstream context for BodyCaptureConsumer metadata capture
         emit_handler_error(
             req_id=req_id,
@@ -629,10 +769,11 @@ async def process_streaming_request(
             upstream_model=upstream_model,
             dispatcher=dispatcher,
         )
-        yield f"data: {json.dumps({'error': {'message': str(e)}})}\n\n".encode("utf-8")
-        # Yield finish_reason before [DONE] even on error
-        stop_chunk = json.dumps({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
-        yield f"data: {stop_chunk}\n\n".encode("utf-8")
+        if isinstance(e, _UpstreamStreamError):
+            error_payload = _upstream_error_sse_payload(e.status_code, e.error_body)
+        else:
+            error_payload = {"error": {"message": str(e) or type(e).__name__}}
+        yield f"data: {json.dumps(error_payload)}\n\n".encode("utf-8")
         yield b"data: [DONE]\n\n"
         # O10-NF02: emit performance metrics on error path for parity with non-streaming
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -668,6 +809,8 @@ async def process_streaming_request(
             dispatcher=dispatcher,
         )
         return
+    if on_upstream_success is not None:
+        on_upstream_success()
     emit_downstream_complete(
         req_id=req_id,
         total_yielded=chunk_count,
@@ -682,8 +825,6 @@ async def process_streaming_request(
     # The pipeline and direct-upstream paths both expose one semantic result.
     # Emit it once, after all client-visible SSE frames have been observed.
     if transcript is not None:
-        from ..observability import events_execution as _exec
-
         assistant_text = "".join(transcript.content)
         reasoning_text = "".join(transcript.reasoning)
         _exec.emit_assistant(

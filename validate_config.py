@@ -169,8 +169,8 @@ def main():
         epilog="""
 Examples:
   %(prog)s --config config.yaml validate
-  %(prog)s --config config.yaml healthcheck --timeout 5
-  %(prog)s --config config.yaml --full-check --verbose
+  %(prog)s healthcheck --config config.yaml --timeout 5
+  %(prog)s full-check --config config.yaml --verbose
         """,
     )
     
@@ -201,24 +201,28 @@ Examples:
     common_args = argparse.ArgumentParser(add_help=False)
     common_args.add_argument(
         "--config", "-c",
-        default="config.yaml",
+        # The root parser owns defaults.  Suppressing defaults here means an
+        # option supplied before a subcommand is not overwritten by the
+        # subparser's duplicate option definition.
+        default=argparse.SUPPRESS,
         help="Path to configuration file (default: config.yaml)",
     )
     common_args.add_argument(
         "--timeout", "-t",
         type=int,
-        default=10,
+        default=argparse.SUPPRESS,
         help="Timeout in seconds for health checks (default: 10)",
     )
     common_args.add_argument(
         "--max-concurrent", "-m",
         type=int,
-        default=5,
+        default=argparse.SUPPRESS,
         help="Maximum concurrent health check requests (default: 5)",
     )
     common_args.add_argument(
         "--verbose", "-v",
         action="store_true",
+        default=argparse.SUPPRESS,
         help="Enable verbose output",
     )
 

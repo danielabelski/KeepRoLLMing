@@ -28,12 +28,26 @@ Modules are sorted by their declared priority in each phase. A route may set
 `priority` only when it needs an explicit override; configuration mapping order
 does not control execution order.
 
+When `multimodal_validator.max_images` is set, its default
+`max_images_policy: strip_first` removes the oldest excess image parts and
+retains the newest images. `strip_latest` is available when retaining the
+earliest images is preferable. In either case an omitted image becomes the
+configured replacement text rather than altering the message shape.
+
 ## Streaming contract
 
 Streaming finalizers see the same canonical stream events in priority order.
 They may buffer output internally, but final `finish_reason` and `[DONE]` stay
 behind the terminal decision barrier. This preserves compatibility with strict
 OpenAI clients while allowing nudge and loop-recovery behaviour.
+
+Structured tool-call deltas are relayed as they arrive when no finalizer needs
+to hold them. With exact-only `model_tool_loop_stopper`, a call whose function
+name cannot match an earlier relevant call is also released early; a
+same-name call waits until its complete canonical arguments can be compared.
+Fuzzy/AB loop modes and recovery modes that could need to retract a turn keep
+their conservative terminal-buffering behaviour. A client must always treat
+the terminal `finish_reason` as authoritative.
 
 For concrete settings, use the individual routes in
 [`config.example.full.yaml`](../config.example.full.yaml). They intentionally

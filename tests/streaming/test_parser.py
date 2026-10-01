@@ -18,6 +18,7 @@ from __future__ import annotations
 from keeprollming.streaming.events import (
     AssistantTextDelta,
     Done,
+    Error,
     Finish,
     Keepalive,
     ReasoningTextDelta,
@@ -46,6 +47,30 @@ def test_parse_assistant_text_delta():
     text_deltas = [e for e in events if isinstance(e, AssistantTextDelta)]
     assert len(text_deltas) == 1
     assert text_deltas[0].delta == "Hello"
+
+
+def test_parse_vllm_reasoning_alias_as_reasoning_delta():
+    """VLLM's ``delta.reasoning`` is restreamed as canonical reasoning."""
+    chunk = b'data: {"choices":[{"delta":{"reasoning":"Think first"}}]}\n\n'
+    events = _PARSER.parse_sync([chunk])
+
+    reasoning_deltas = [e for e in events if isinstance(e, ReasoningTextDelta)]
+    assert [event.delta for event in reasoning_deltas] == ["Think first"]
+
+
+def test_parse_embedded_upstream_error_envelope():
+    """HTTP-200 SSE error envelopes become canonical Error events."""
+    chunk = (
+        b'data: {"error":{"message":"sampling parameter unsupported",'
+        b'"type":"BadRequestError","code":400}}\n\n'
+    )
+    events = StreamParser().parse_sync([chunk])
+
+    errors = [event for event in events if isinstance(event, Error)]
+    assert len(errors) == 1
+    assert errors[0].message == "sampling parameter unsupported"
+    assert errors[0].code == "BadRequestError"
+    assert errors[0].metadata["error_code"] == 400
 
 
 def test_parse_preserves_openai_response_envelope():

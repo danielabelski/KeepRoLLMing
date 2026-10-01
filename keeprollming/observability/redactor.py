@@ -12,7 +12,10 @@ Invariants:
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
+
+from .events import RuntimeEvent
 
 
 class Redactor:
@@ -43,3 +46,38 @@ class NoOpRedactor(Redactor):
 
     def redact(self, data: Any) -> Any:
         return data
+
+
+class ZeroContentRedactor(Redactor):
+    """Preserve operational facts while removing every unclassified string.
+
+    This is intentionally stricter than a PII detector: operators selecting
+    privacy mode ask KRM not to persist transcript-like content at all. String
+    values are therefore omitted unless their field is a known operational
+    identifier (route, model, status reason, etc.).
+    """
+
+    _SAFE_STRING_FIELDS = {
+        "route", "route_name", "resolved_route", "upstream_model", "model",
+        "upstream_url", "url", "endpoint", "method", "phase", "boundary",
+        "direction", "finish_reason", "error_type", "component",
+        "policy", "state", "client_model", "type", "code",
+    }
+
+    def redact(self, data: Any) -> Any:
+        return self._redact(data)
+
+    def redact_event(self, event: RuntimeEvent) -> RuntimeEvent:
+        """Return a safe projection without mutating the authoritative event."""
+        return replace(event, data=self._redact(event.data))
+
+    def _redact(self, value: Any, *, field: str | None = None) -> Any:
+        if isinstance(value, bytes):
+            return {"_content_omitted": True, "byte_length": len(value)}
+        if isinstance(value, str):
+            return value if field in self._SAFE_STRING_FIELDS else "[content omitted]"
+        if isinstance(value, dict):
+            return {str(key): self._redact(item, field=str(key)) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self._redact(item, field=field) for item in value]
+        return value

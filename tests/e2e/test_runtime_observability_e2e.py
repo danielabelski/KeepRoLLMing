@@ -174,6 +174,104 @@ def test_streaming_sends_reasoning_before_tool_call_and_terminal_finish(
     assert reasoning_index < tool_call_index < terminal_index
 
 
+def test_direct_stream_relays_tool_call_before_upstream_terminal_barrier(
+    orchestrator_server, configure_fake_backend
+):
+    """A direct route exposes a tool delta before the delayed terminal frame.
+
+    This is intentionally a cadence test, not merely an ordering test: the
+    former terminal-only ToolCallFinalizer would withhold the first downstream
+    byte until the backend's delayed finish frame arrived.
+    """
+    configure_fake_backend({
+        "chat": {
+            "stream_pieces": [],
+            "tool_calls": [{
+                "index": 0,
+                "id": "call-readme",
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": '{"path":"README.md"}',
+                },
+            }],
+            "include_usage": True,
+            "chunk_delay_ms": 600,
+        }
+    })
+
+    started = time.monotonic()
+    with httpx.stream(
+        "POST", f"{orchestrator_server.base_url}/v1/chat/completions",
+        json={
+            "model": "pass/main-model",
+            "stream": True,
+            "messages": [{"role": "user", "content": "Read the README."}],
+        },
+        timeout=15.0,
+    ) as response:
+        assert response.status_code == 200
+        first_payload = next(
+            json.loads(line.removeprefix("data: "))
+            for line in response.iter_lines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        )
+
+    assert time.monotonic() - started < 0.45
+    delta = first_payload["choices"][0]["delta"]
+    assert delta["tool_calls"][0]["function"]["name"] == "read_file"
+    assert first_payload["choices"][0].get("finish_reason") is None
+
+
+def test_exact_tls_releases_safe_tool_call_before_upstream_terminal_barrier(
+    orchestrator_server, configure_fake_backend
+):
+    """Exact TLS retains duplicate protection without terminal-only delivery.
+
+    The first tool call cannot duplicate anything in the current conversation,
+    and this route intentionally has no fuzzy/A-B heuristics.  Its first delta
+    must therefore reach the client before the delayed finish frame.
+    """
+    configure_fake_backend({
+        "chat": {
+            "stream_pieces": [],
+            "tool_calls": [{
+                "index": 0,
+                "id": "call-safe-read",
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": '{"path":"README.md"}',
+                },
+            }],
+            "include_usage": True,
+            "chunk_delay_ms": 600,
+        }
+    })
+
+    started = time.monotonic()
+    with httpx.stream(
+        "POST", f"{orchestrator_server.base_url}/v1/chat/completions",
+        json={
+            "model": "internal/exact-tls",
+            "stream": True,
+            "messages": [{"role": "user", "content": "Read the README."}],
+        },
+        timeout=15.0,
+    ) as response:
+        assert response.status_code == 200
+        first_payload = next(
+            json.loads(line.removeprefix("data: "))
+            for line in response.iter_lines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        )
+
+    assert time.monotonic() - started < 0.45
+    delta = first_payload["choices"][0]["delta"]
+    assert delta["tool_calls"][0]["function"]["name"] == "read_file"
+    assert first_payload["choices"][0].get("finish_reason") is None
+
+
 def test_direct_upstream_streaming_also_emits_assistant_and_usage(
     orchestrator_server, configure_fake_backend
 ):

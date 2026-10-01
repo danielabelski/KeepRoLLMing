@@ -61,9 +61,13 @@ against a specific failure mode in configuration.
 - **Composable reliability modules:** request, response, and streaming modules
   for context handling, recovery, tool calls, and reasoning.
 - **OpenAI-compatible streaming:** canonical events preserve the ordering of
-  reasoning, tool calls, terminal `finish_reason`, and `[DONE]`.
+  reasoning, tool calls, terminal `finish_reason`, and `[DONE]`; eligible
+  structured tool calls stream as they arrive without weakening loop safety.
+- **Route resilience controls:** opt-in admission limits and circuit breakers
+  make capacity and upstream failure behavior explicit per route.
 - **Local observability:** configurable PLAIN/JSON projections, performance
-  metrics, and opt-in raw SSE capture for focused debugging.
+  metrics, and opt-in raw SSE capture for focused debugging; privacy mode can
+  retain operational facts without persisting request or model content.
 - **Per-route configuration:** inheritance keeps shared backend settings in
   one place while each public route stays explicit.
 

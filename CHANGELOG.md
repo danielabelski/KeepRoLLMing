@@ -2,6 +2,51 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.9.4 — 2026-10-01
+
+### Added
+- Native structured tool-call deltas can now reach compatible clients during a
+  streaming turn instead of always waiting for `finish_reason: tool_calls`.
+  Exact Tool Loop Stopper protection releases calls early only when they are
+  provably distinct; conservative loop policies retain terminal buffering.
+- Optional per-route admission control: `max_concurrent` and `queue_timeout`
+  bound route work and expose active, pending, queued and rejected state via
+  the private `GET /routes` status endpoint.
+- Optional per-route circuit breaking with observable `CLOSED`, `OPEN`, and
+  `HALF_OPEN` state and bounded recovery probes.
+- `observability.privacy_mode` prevents request/model content from reaching
+  PLAIN, JSON, raw-trace and capture persistence while retaining operational
+  route, usage and latency metadata.
+- Fallback observability now records the fully resolved retry chain and every
+  decision's source/target route, model and endpoint, attempt position, and
+  trigger (HTTP status, timeout, transport error, or open circuit).
+
+### Changed
+- The test suite has a 120-second default per-test timeout, with documented
+  opt-outs only for deliberately longer integration scenarios.
+- `multimodal_validator.max_images_policy` makes image-overflow retention
+  explicit: the default `strip_first` retains the newest images, while
+  `strip_latest` preserves the former policy.
+
+### Fixes
+- A route fallback now resolves and uses the fallback route's own upstream URL,
+  model, headers, and timeout. It is applied to streaming pre-output connect/
+  HTTP failures as well as non-streaming failures; no retry occurs after
+  client-visible streaming output has begun.
+- Upstream HTTP and SSE failures are returned as upstream errors rather than
+  becoming an empty successful assistant response.
+- Upstream application errors embedded in an HTTP-200 SSE stream now terminate
+  the response as errors instead of being silently discarded. Terminal chunks
+  that also contain the final tool-call delta retain that delta.
+- An upstream HTTP `400` is treated as a terminal client-request error: KRM
+  preserves its OpenAI-compatible error envelope and does not consume a
+  fallback attempt. Failures recovered by a later fallback remain visible in
+  structured diagnostics and raw capture.
+- A Tool Loop Stopper fallback now continues through Model Nudge when it
+  matches the configured nudge condition.
+- `default_request_timeout` remains intact when it is inherited through route
+  composition, rather than silently becoming the legacy 120-second value.
+
 ## v0.9.3 — 2026-08-29
 
 ### Added

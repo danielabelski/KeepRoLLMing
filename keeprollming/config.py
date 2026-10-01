@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import json
 import yaml
@@ -103,7 +104,7 @@ def load_user_routes(config: Dict[str, Any]) -> List[Route]:
                     result = route_data.get(key) if key in route_data else None
                     if result is not None:
                         return result  # type: ignore
-                    elif default is None and key != "fallback_chain":
+                    elif default is None:
                         return None  # type: ignore
                     else:
                         return default  # type: ignore
@@ -128,11 +129,14 @@ def load_user_routes(config: Dict[str, Any]) -> List[Route]:
                     upstream_headers=get_or_unset("upstream_headers", {}),  # type: ignore
                     api_key=get_or_unset("api_key", None),  # type: ignore
                     api_keys=get_or_unset("api_keys", None),  # type: ignore
-                    fallback_chain=get_or_unset("fallback_chain", []),  # type: ignore
+                    # ``None`` means inherit; an explicit [] clears a parent chain.
+                    fallback_chain=get_or_unset("fallback_chain", None),  # type: ignore
                     circuit_breaker_enabled=get_or_unset("circuit_breaker_enabled", False),  # type: ignore
                     failure_threshold=get_or_unset("failure_threshold", 3),  # type: ignore
                     recovery_timeout=get_or_unset("recovery_timeout", 60),  # type: ignore
                     request_timeout=get_or_unset("request_timeout", None),  # type: ignore
+                    max_concurrent=get_or_unset("max_concurrent", None),  # type: ignore
+                    queue_timeout=get_or_unset("queue_timeout", None),  # type: ignore
                     cost_priority=get_or_unset("cost_priority", 999),  # type: ignore
                     performance_logs_dir=get_or_unset("performance_logs_dir", None),  # type: ignore
                     capabilities=get_or_unset("capabilities", None),  # type: ignore
@@ -167,7 +171,7 @@ def load_user_routes(config: Dict[str, Any]) -> List[Route]:
                     result = route_data.get(key) if key in route_data else None
                     if result is not None:
                         return result  # type: ignore
-                    elif default is None and key != "fallback_chain":
+                    elif default is None:
                         return None  # type: ignore
                     else:
                         return default  # type: ignore
@@ -200,11 +204,14 @@ def load_user_routes(config: Dict[str, Any]) -> List[Route]:
                     upstream_headers=get_or_unset("upstream_headers", {}),  # type: ignore
                     api_key=get_or_unset("api_key", None),  # type: ignore
                     api_keys=get_or_unset("api_keys", None),  # type: ignore
-                    fallback_chain=get_or_unset("fallback_chain", []),  # type: ignore
+                    # ``None`` means inherit; an explicit [] clears a parent chain.
+                    fallback_chain=get_or_unset("fallback_chain", None),  # type: ignore
                     circuit_breaker_enabled=get_or_unset("circuit_breaker_enabled", False),  # type: ignore
                     failure_threshold=get_or_unset("failure_threshold", 3),  # type: ignore
                     recovery_timeout=get_or_unset("recovery_timeout", 60),  # type: ignore
                     request_timeout=get_or_unset("request_timeout", None),  # type: ignore
+                    max_concurrent=get_or_unset("max_concurrent", None),  # type: ignore
+                    queue_timeout=get_or_unset("queue_timeout", None),  # type: ignore
                     cost_priority=get_or_unset("cost_priority", 999),  # type: ignore
                     performance_logs_dir=get_or_unset("performance_logs_dir", None),  # type: ignore
                     capabilities=get_or_unset("capabilities", None),  # type: ignore
@@ -247,6 +254,37 @@ def validate_resolved_route_filters(routes: List[Route]) -> None:
             raise ValueError(
                 f"invalid filters for resolved route '{route.name}': {exc}"
             ) from exc
+
+
+def validate_resolved_route_admission(routes: List[Route]) -> None:
+    """Reject invalid route concurrency settings during config load/reload."""
+    from keeprollming.routing.router import resolve_inherited_route
+
+    routes_by_name = {route.name: route for route in routes}
+    for route in routes:
+        resolved = resolve_inherited_route(route, routes_by_name)
+        limit = resolved.max_concurrent
+        if limit is not None and (
+            isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0
+        ):
+            raise ValueError(
+                f"invalid max_concurrent for resolved route '{route.name}': "
+                "expected a positive integer or null"
+            )
+        timeout = resolved.queue_timeout
+        if timeout is not None:
+            try:
+                value = float(timeout)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"invalid queue_timeout for resolved route '{route.name}': "
+                    "expected a non-negative number or null"
+                ) from exc
+            if isinstance(timeout, bool) or not math.isfinite(value) or value < 0:
+                raise ValueError(
+                    f"invalid queue_timeout for resolved route '{route.name}': "
+                    "expected a non-negative number or null"
+                )
 
 
 def resolve_route_settings(
@@ -487,13 +525,18 @@ def check_config_reload() -> bool:
             # Validate before applying (basic check)
             if "routes" not in new_config and "upstream_base_url" not in new_config:
                 return False
+
+            # Validate a complete candidate before mutating the live runtime.
+            # A typo must leave the last known-good route table intact.
+            new_routes = load_user_routes(new_config)
+            validate_resolved_route_filters(new_routes)
+            validate_resolved_route_admission(new_routes)
             
             # Update global state atomically
             CONFIG.clear()
             CONFIG.update(new_config)
             USER_ROUTES.clear()
-            USER_ROUTES.extend(load_user_routes(CONFIG))
-            validate_resolved_route_filters(USER_ROUTES)
+            USER_ROUTES.extend(new_routes)
             
             # Update DEFAULTS
             ctx_len = CONFIG["defaults"]["ctx_len"] if "defaults" in CONFIG else 8192
@@ -526,6 +569,7 @@ def check_config_reload() -> bool:
 # Parse user-defined routes from config
 USER_ROUTES: List[Route] = load_user_routes(CONFIG)
 validate_resolved_route_filters(USER_ROUTES)
+validate_resolved_route_admission(USER_ROUTES)
 
 # Create DefaultSettings object for resolution
 DEFAULTS = DefaultSettings(
@@ -592,7 +636,10 @@ def get_route_settings(route: Route, model: str) -> "RouteSettings":
 
     Returns a typed RouteSettings object.
     """
-    return _get_route_settings(route, model)
+    # Keep root defaults in the resolved settings.  In particular,
+    # ``request_timeout`` must inherit ``default_request_timeout`` instead of
+    # silently falling back to RouteSettings' standalone 120-second value.
+    return _get_route_settings(route, model, defaults=DEFAULTS)
 
 
 # Extract values from config (no environment variable overrides - all in YAML now)

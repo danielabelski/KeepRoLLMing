@@ -70,6 +70,77 @@ Route settings include `api_key`, `upstream_headers`, `summary_model`,
 settings, and `overrides` for upstream inference parameters. The full example
 shows each supported field.
 
+### Route fallback chains
+
+`fallback_chain` is an ordered list of route names. KRM resolves each named
+route independently, so a fallback uses its own upstream URL, model,
+authentication headers, and request timeout. An omitted value inherits the
+parent chain; an explicit empty list (`fallback_chain: []`) clears it. Direct
+model-name entries remain supported for existing configurations, but retain the
+primary route's transport settings.
+
+For streaming requests, KRM may retry only before any upstream/client-visible
+content has been received. Once a stream has committed output, retrying would
+duplicate or reorder client content, so the original error is returned instead.
+
+An upstream HTTP `400` is considered a client-request error, not an unhealthy
+route: KRM returns the provider's OpenAI-compatible error envelope unchanged
+and does not try the fallback chain. In streaming mode the same envelope is
+sent as the terminal SSE error event followed by `[DONE]`; in non-streaming
+mode its original HTTP status and body are preserved. A `404` model/endpoint
+failure remains eligible for the normal pre-output fallback policy. When a
+later fallback succeeds, the earlier upstream error is retained in structured
+observability and raw capture for diagnosis, but is not exposed to the client.
+
+### Per-route admission control
+
+Routes are unlimited by default. Set a positive `max_concurrent` to cap the
+number of logical requests that may be in progress for that route. The slot is
+held for a complete streaming response, including any time spent waiting for
+the client to consume it. `queue_timeout` is expressed in seconds: omit it or
+set it to `0` to reject excess requests immediately with `429`; a positive
+value permits bounded waiting before the same rejection.
+
+```yaml
+routes:
+  chat/interactive:
+    model: qwen
+    max_concurrent: 2
+    queue_timeout: 5
+```
+
+The private `GET /routes` endpoint exposes the configured admission settings,
+currently queued requests, and active requests for dashboard use.
+
+### Circuit breaker
+
+Set `circuit_breaker_enabled: true` on a route to stop sending requests to an
+upstream that is persistently failing. `failure_threshold` is the number of
+terminal upstream failures before the circuit opens; `recovery_timeout` is the
+number of seconds before one half-open probe is permitted. A successful probe
+closes and resets the breaker; a failed probe reopens it. While open KRM
+returns `503` with `code: circuit_open`, unless the route has a fallback chain,
+in which case it immediately uses the first configured fallback route.
+
+### Privacy-preserving observability
+
+`observability.privacy_mode` defaults to `false`. When enabled, KRM still
+executes requests unchanged but prevents model/user content from reaching its
+observability persistence boundaries: PLAIN and JSON projections omit
+transcripts, reasoning and tool payloads; raw traces retain timing, direction
+and byte length but not SSE bytes; request and error captures retain only safe
+metadata. Route, model, status, usage and latency remain available for
+operations. Existing files are not retroactively altered.
+
+```yaml
+observability:
+  privacy_mode: true
+```
+
+This intentionally disables replay-grade raw captures for new requests. Keep
+the default only where the diagnostic value and retention controls are
+appropriate for the content being processed.
+
 ## Client API keys
 
 `api_key` (singular) remains the bearer credential KRM sends **to an
@@ -126,6 +197,13 @@ debugging, but are capped to avoid an unbounded response.
 
 ## Filters
 
+In streaming mode, a tool/reasoning loop stopper's exhausted fallback is
+evaluated by Model Nudge before closing the response. If its text matches a
+nudge trigger and continuation budget remains, KRM appends the continuation
+to that fallback. Rejected tool calls do not suppress this check. The loop
+stopper's retry budget is not reset; Nudge consumes its own budget, subject
+to the shared recovery limit. Non-matching fallbacks close normally.
+
 Filters live directly under `routes.<name>.filters`:
 
 ```yaml
@@ -158,6 +236,13 @@ validated at startup/reload: a missing, unreadable, or invalid file prevents
 that configuration from being applied. This works identically for every
 route, including `code/architect` and `code/executor`.
 
+`multimodal_validator.max_images` optionally bounds the number of image parts
+sent upstream. When it is exceeded, `max_images_policy: strip_first` (the
+default) replaces the oldest excess images and retains the newest ones.
+Set `max_images_policy: strip_latest` to retain the oldest images instead.
+Stripped parts remain visible to the model as
+`max_images_replacement_text`, preserving the surrounding message structure.
+
 ## Observability
 
 PLAIN, JSON, and server logs are independent projections of runtime events.
@@ -179,6 +264,15 @@ observability:
 
 Use `selected_routes` for short, targeted raw captures. Raw traces contain
 transport bytes and can include sensitive content.
+
+When a route declares `fallback_chain`, KRM emits two related operational
+events. `execution.chat.fallback_chain` records the resolved, non-secret
+attempt plan (position, route, model, endpoint and timeout). Each actual
+transition emits `execution.chat.fallback`, identifying the failed and next
+route/model/endpoint, attempt position, and cause (`http_status`, `timeout`,
+`transport_error`, or `circuit_open`). PLAIN renders these as a compact
+`FROM`/`TO` block; JSON and raw traces retain the structured fields. Headers
+and API keys are never included.
 
 PLAIN, JSON and compact server projections never synchronously write on a
 streaming request. They each retain event order through a bounded FIFO worker.

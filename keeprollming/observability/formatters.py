@@ -352,9 +352,44 @@ class PlainTextFormatter(Formatter):
             return " ".join(parts)
 
         if subtype == "fallback":
-            from_m = d.get("from_model", "")
-            to_m = d.get("to_model", "")
-            return f"{ts} {req_id_tag} execution.fallback {from_m}→{to_m}"
+            parts = [f"{ts} {req_id_tag} execution.chat.fallback"]
+            if d.get("attempt") is not None:
+                parts.append(f"attempt={d['attempt']}/{d.get('total_attempts', '?')}")
+            if d.get("reason"):
+                parts.append(f"reason={d['reason']}")
+            if d.get("status") is not None:
+                parts.append(f"status={d['status']}")
+            if d.get("error_type"):
+                parts.append(f"error_type={d['error_type']}")
+            lines = [" ".join(parts)]
+            lines.append(
+                "    FROM "
+                f"route={d.get('from_route', '')} model={d.get('from_model', '')} "
+                f"upstream={_short_url(d.get('from_upstream_url', ''))}"
+            )
+            lines.append(
+                "    TO   "
+                f"route={d.get('to_route', '')} model={d.get('to_model', '')} "
+                f"upstream={_short_url(d.get('to_upstream_url', ''))}"
+            )
+            if d.get("error"):
+                lines.append(f"    ERROR: {_truncate(str(d['error']), 240)}")
+            return "\n".join(lines)
+
+        if subtype == "fallback_chain":
+            attempts = d.get("attempts", [])
+            lines = [f"{ts} {req_id_tag} execution.chat.fallback_chain attempts={len(attempts)}"]
+            for item in attempts:
+                if not isinstance(item, dict):
+                    continue
+                lines.append(
+                    "    "
+                    f"[{item.get('position', '?')}] route={item.get('route', '')} "
+                    f"model={item.get('model', '')} "
+                    f"upstream={_short_url(item.get('upstream_url', ''))} "
+                    f"timeout_s={item.get('timeout_s', '')}"
+                )
+            return "\n".join(lines)
 
         # Generic execution event
         return self._render_generic_kv(ts, req_id_tag, event.type, d)
@@ -496,7 +531,7 @@ class PlainTextFormatter(Formatter):
     def _render_execution_error(self, ts: str, req_id_tag: str, subtype: str, data: dict) -> str:
         """Render execution error events with details."""
         parts = [f"{ts} {req_id_tag} execution.{subtype}"]
-        error = data.get("error", data.get("message", ""))
+        error = data.get("error", data.get("message", data.get("body", "")))
         status = data.get("status")
         upstream = data.get("upstream_url", data.get("url", ""))
         route = data.get("route", "")
@@ -505,6 +540,10 @@ class PlainTextFormatter(Formatter):
 
         if status is not None:
             parts.append(f"status={status}")
+        if data.get("recovered"):
+            parts.append("recovered_by_fallback=true")
+            if data.get("attempt") is not None:
+                parts.append(f"attempt={data['attempt']}/{data.get('total_attempts', '?')}")
         if route:
             parts.append(f'route="{route}"')
         if model:

@@ -18,8 +18,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
-from keeprollming.config import CONFIG
-from keeprollming.routing import Route, get_route_settings, resolve_route
+from keeprollming.config import CONFIG, get_route_settings
+from keeprollming.routing import Route, resolve_route
 
 
 @dataclass

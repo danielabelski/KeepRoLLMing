@@ -20,6 +20,7 @@ import pytest
 from keeprollming.streaming.events import (
     AssistantTextDelta,
     Done,
+    Error,
     Finish,
     ToolCallDelta,
 )
@@ -32,6 +33,7 @@ from keeprollming.streaming.parser import StreamParser
 from keeprollming.streaming.accounting import ExecutionUsage
 from keeprollming.streaming.serializer import OpenAISSESerializer
 from keeprollming.filters.timestamp.stream import TimestampFinalizer
+from keeprollming.filters.tool_loop_stopper.stream import TLSFinalizer
 from keeprollming.streaming.runner import (
     collect_stream_events,
     run_stream,
@@ -41,6 +43,7 @@ from tests.helpers.stream_client import (
     TestDone,
     TestFinish,
     TestStreamEvent,
+    TestToolCallComplete,
     parse_sse_events,
     collect_assistant_text,
     assert_stream_protocol_valid,
@@ -146,6 +149,73 @@ def test_runner_basic_text_finish_done():
 
     done_events = [e for e in events if isinstance(e, TestDone)]
     assert len(done_events) == 1
+
+
+def test_runner_progressive_exact_tls_yields_distinct_tool_before_finish():
+    """Exact TLS does not make a provably distinct call wait for Finish."""
+    import json
+
+    tool_payload = json.dumps({
+        "choices": [{
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call-read",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": '{"path":"README.md"}',
+                    },
+                }],
+            },
+        }],
+    })
+    tool_frame = f"data: {tool_payload}\n\n".encode()
+    finish_frame = _make_finish_chunk("tool_calls")
+
+    async def _scenario():
+        release_finish = asyncio.Event()
+
+        async def upstream():
+            yield tool_frame
+            await release_finish.wait()
+            yield finish_frame
+            yield _make_done_chunk()
+
+        finalizers = [
+            ToolCallFinalizer(flush_valid_only=True, stream_deltas=True),
+            TLSFinalizer(
+                progressive_exact=True,
+                conversation_tool_calls=[{
+                    "id": "previous-write",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": '{"path":"output.txt"}',
+                    },
+                }],
+            ),
+        ]
+        stream = run_stream(
+            upstream_chunks=upstream(),
+            finalizers=finalizers,
+            serializer=OpenAISSESerializer(),
+            parser=StreamParser(),
+            # A non-null factory exercises the runner's recovery-isolation
+            # decision; exact progressive TLS must still be live.
+            upstream_factory=lambda _: upstream(),
+        )
+        first = await asyncio.wait_for(stream.__anext__(), timeout=0.2)
+        release_finish.set()
+        remainder = []
+        async for frame in stream:
+            remainder.append(frame)
+        return first, remainder
+
+    first, remainder = asyncio.run(_scenario())
+    assert b'"tool_calls"' in first
+    assert b'"finish_reason"' not in first
+
+    events = parse_sse_events([first, *remainder])
+    assert_stream_protocol_valid(events, profile="strict")
 
 
 # ---------------------------------------------------------------------------
@@ -548,6 +618,47 @@ def test_runner_collect_stream_events_sync():
     assert finishes[0].reason == "stop"
 
 
+def test_runner_propagates_embedded_upstream_error_without_synthetic_finish():
+    """An SSE error envelope reaches the client instead of empty assistant."""
+    chunks = _make_chunks(
+        b'data: {"error":{"message":"sampling parameter unsupported",'
+        b'"type":"BadRequestError","code":400}}\n\n',
+        _make_done_chunk(),
+    )
+
+    events = collect_stream_events(chunks)
+
+    errors = [event for event in events if isinstance(event, Error)]
+    assert len(errors) == 1
+    assert errors[0].message == "sampling parameter unsupported"
+    assert len([event for event in events if isinstance(event, Done)]) == 1
+    assert not any(isinstance(event, Finish) for event in events)
+
+
+def test_run_stream_serializes_embedded_upstream_error_and_done():
+    """The async runner emits the upstream error and terminal DONE frame."""
+    chunks = _make_chunks(
+        b'data: {"error":{"message":"sampling parameter unsupported",'
+        b'"type":"BadRequestError","code":400}}\n\n',
+        _make_done_chunk(),
+    )
+
+    async def _run():
+        return [
+            chunk
+            async for chunk in run_stream(
+                upstream_chunks=iter(chunks),
+                serializer=OpenAISSESerializer(),
+                parser=StreamParser(),
+            )
+        ]
+
+    frames = asyncio.run(_run())
+    assert any(b"sampling parameter unsupported" in frame for frame in frames)
+    assert frames[-1] == b"data: [DONE]\n\n"
+    assert not any(b'"finish_reason"' in frame for frame in frames)
+
+
 # ---------------------------------------------------------------------------
 # test_runner_keepalive_passthrough
 # ---------------------------------------------------------------------------
@@ -748,6 +859,69 @@ def test_runner_toolcall_finalizer_produces_tool_call_complete():
 
     # Done is last
     assert isinstance(events[-1], TestDone)
+
+
+def test_runner_preserves_final_tool_arguments_in_finish_frame():
+    """A terminal frame may contain both the final argument bytes and finish.
+
+    vLLM commonly emits the closing ``\"}`` of a structured tool call in the
+    same SSE frame as ``finish_reason=tool_calls``.  The downstream stream must
+    retain those bytes or strict clients receive malformed JSON.
+    """
+    import json
+
+    args = '{"file_path":"report.json","content":"complete"}'
+    first_fragment, final_fragment = args[:-2], args[-2:]
+    first_frame = {
+        "choices": [{
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_write",
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": first_fragment,
+                    },
+                }],
+            },
+            "finish_reason": None,
+        }],
+    }
+    terminal_frame = {
+        "choices": [{
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "function": {"arguments": final_fragment},
+                }],
+            },
+            "finish_reason": "tool_calls",
+        }],
+    }
+    chunks = _make_chunks(
+        f"data: {json.dumps(first_frame)}\n\n",
+        f"data: {json.dumps(terminal_frame)}\n\n",
+        _make_done_chunk(),
+    )
+
+    async def _run():
+        async for chunk in run_stream(
+            upstream_chunks=iter(chunks),
+            finalizers=[ToolCallFinalizer(stream_deltas=True)],
+            serializer=OpenAISSESerializer(),
+            parser=StreamParser(),
+        ):
+            yield chunk
+
+    events = parse_sse_events(_collect_chunks(_run()))
+    tool_call = next(
+        event for event in events
+        if isinstance(event, TestToolCallComplete)
+    )
+    assert tool_call.arguments_json == args
+    assert tool_call.arguments_obj == json.loads(args)
+    assert_stream_protocol_valid(events, profile="strict")
 
 
 # ---------------------------------------------------------------------------

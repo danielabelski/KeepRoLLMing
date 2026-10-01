@@ -125,3 +125,18 @@ def test_snapshot_exposes_pending_and_active_requests() -> None:
         "request_id": "active", "phase": "streaming", "stream": True,
         "started_at": snapshot["active_requests"][0]["started_at"], "elapsed_ms": 1000.0,
     }]
+
+
+def test_snapshot_exposes_queued_admission_requests() -> None:
+    registry = RouteStatusRegistry(clock=lambda: NOW)
+    registry(_event(
+        "request.lifecycle.admission.queued",
+        {"route": "chat/main", "max_concurrent": 1}, req_id="queued",
+    ))
+
+    snapshot = registry.snapshot("chat/main", now=NOW + 1)
+
+    assert snapshot["queued_requests"] == [{
+        "request_id": "queued", "phase": "queued", "stream": None,
+        "started_at": snapshot["queued_requests"][0]["started_at"], "elapsed_ms": 1000.0,
+    }]

@@ -58,7 +58,7 @@ def test_fake_quickstart_serves_its_documented_route() -> None:
                 time.sleep(0.2)
                 continue
             assert response.status_code == 200, response.text
-            assert response.json()["choices"][0]["message"]["content"] == "FAKE BACKEND OK"
+            assert response.json()["choices"][0]["message"]["content"] == "FAKE OK"
             return
         raise AssertionError("quick-start did not become ready within 15 seconds")
     finally:

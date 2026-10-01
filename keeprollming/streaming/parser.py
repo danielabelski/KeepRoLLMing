@@ -7,7 +7,8 @@ Design:
 - Accumulates partial SSE frames across chunks (same strategy as
   ``tests/helpers/stream_client.py``).
 - Handles ``data: [DONE]``, ``: keepalive``, ``choices[0].delta.content``,
-  ``choices[0].delta.finish_reason``, and ``choices[0].delta.reasoning_content``.
+  ``choices[0].delta.finish_reason``, and reasoning deltas in either the
+  ``reasoning_content`` or VLLM ``reasoning`` field.
 - ``ToolCallDelta`` is supported as pass-through (optional, trivial).
 - ``ToolCallComplete`` is NOT emitted in Phase 1.
 - Invalid JSON frames are silently skipped (``continue``).
@@ -22,6 +23,7 @@ from typing import Any, AsyncIterator, Dict, Iterable, List, Optional, Union
 from .events import (
     AssistantTextDelta,
     Done,
+    Error,
     Finish,
     Keepalive,
     ReasoningTextDelta,
@@ -69,7 +71,7 @@ def _parse_single_frame(
     pending_content:
         Mutable list accumulating ``delta.content`` across frames.
     pending_reasoning:
-        Mutable list accumulating ``delta.reasoning_content`` across frames.
+        Mutable list accumulating reasoning deltas across frames.
     pending_tool_calls:
         Mutable dict accumulating tool call deltas by index.
     pending_usage:
@@ -193,6 +195,39 @@ def _parse_json_chunk(
     if isinstance(chunk_usage, dict):
         pending_usage[0] = chunk_usage
 
+    # Some OpenAI-compatible upstreams report application errors inside an
+    # SSE envelope while keeping the HTTP status at 200.  Preserve that error
+    # as a semantic event instead of silently dropping it because there are no
+    # ``choices`` in the payload.
+    error_payload = obj.get("error")
+    if isinstance(error_payload, dict):
+        message = error_payload.get("message") or str(error_payload)
+        # ``type`` is the OpenAI-compatible error discriminator exposed to the
+        # client; retain a numeric/provider ``code`` as metadata as well.
+        code = error_payload.get("type") or error_payload.get("code") or "upstream_error"
+        error_metadata = dict(current_metadata)
+        if error_payload.get("code") is not None:
+            error_metadata["error_code"] = error_payload["code"]
+        events.append(
+            Error(
+                code=str(code),
+                message=str(message),
+                event_id=current_event_id,
+                metadata=error_metadata,
+            )
+        )
+        return events
+    if error_payload is not None:
+        events.append(
+            Error(
+                code="upstream_error",
+                message=str(error_payload),
+                event_id=current_event_id,
+                metadata=current_metadata,
+            )
+        )
+        return events
+
     choices = obj.get("choices")
     if not choices:
         return events
@@ -208,8 +243,12 @@ def _parse_json_chunk(
         # Process delta content BEFORE checking finish_reason so that
         # content and finish_reason in the same chunk are handled correctly.
         if delta:
-            # reasoning_content
+            # OpenAI-compatible providers use reasoning_content; VLLM uses
+            # reasoning for the same semantic channel. Normalize both into
+            # the canonical ReasoningTextDelta event.
             reasoning = delta.get("reasoning_content")
+            if not isinstance(reasoning, str):
+                reasoning = delta.get("reasoning")
             if reasoning is not None and isinstance(reasoning, str):
                 events.append(
                     ReasoningTextDelta(

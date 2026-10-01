@@ -27,6 +27,27 @@ def test_public_configuration_example_loads_through_the_real_loader(example: str
     assert result.returncode == 0, result.stderr
 
 
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--config", "config.example.yaml", "validate"],
+        ["validate", "--config", "config.example.yaml"],
+    ],
+)
+def test_public_config_validator_honors_config_before_or_after_subcommand(
+    arguments: list[str],
+) -> None:
+    result = subprocess.run(
+        [sys.executable, "validate_config.py", *arguments],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "Validating configuration: config.example.yaml" in result.stdout
+
+
 def test_file_backed_system_prompt_is_loaded_relative_to_config_file(tmp_path: Path) -> None:
     (tmp_path / "prompts").mkdir()
     (tmp_path / "prompts" / "architect.md").write_text(

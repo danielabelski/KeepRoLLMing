@@ -16,6 +16,33 @@ def _by_type(finalizers, type_):
 def test_factory_always_includes_protocol_finalizer():
     finalizers = build_finalizers({})
     assert [type(finalizer) for finalizer in finalizers] == [ToolCallFinalizer]
+    assert finalizers[0].stream_deltas is True
+
+
+def test_factory_enables_progressive_exact_tls_without_disabling_tool_deltas():
+    finalizers = build_finalizers({
+        "model_tool_loop_stopper": {"enabled": True},
+    })
+    tool_calls = _by_type(finalizers, ToolCallFinalizer)[0]
+    tls = _by_type(finalizers, TLSFinalizer)[0]
+
+    assert tool_calls.stream_deltas is True
+    assert tls.progressive_exact is True
+    assert tls.allows_live_output is True
+
+
+def test_factory_keeps_fuzzy_or_ab_tls_terminally_buffered():
+    finalizers = build_finalizers({
+        "model_tool_loop_stopper": {
+            "enabled": True,
+            "fuzzy_threshold": 0.9,
+        },
+    })
+    tool_calls = _by_type(finalizers, ToolCallFinalizer)[0]
+    tls = _by_type(finalizers, TLSFinalizer)[0]
+
+    assert tool_calls.stream_deltas is False
+    assert tls.progressive_exact is False
 
 
 def test_factory_uses_enabled_route_configuration_only():

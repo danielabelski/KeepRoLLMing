@@ -309,6 +309,27 @@ def test_toolcall_finalizer_single_complete_tool_call():
     assert finishes[0].reason == "tool_calls"
 
 
+def test_toolcall_finalizer_live_mode_relays_deltas_without_terminal_duplicate():
+    """Live mode preserves upstream tool-call cadence while assembling locally."""
+    finalizer = ToolCallFinalizer(flush_valid_only=True, stream_deltas=True)
+
+    first = _make_delta(
+        index=0,
+        id="call_1",
+        name="read_file",
+        arguments_delta='{"path":"',
+    )
+    second = _make_delta(index=0, arguments_delta='README.md"}')
+
+    assert finalizer.process_event(first) == [first]
+    assert finalizer.process_event(second) == [second]
+
+    # The accumulator is retained for internal validation, but the client has
+    # already received the deltas and must not receive a duplicate complete
+    # call at the terminal barrier.
+    assert finalizer.finalize() == []
+
+
 def test_toolcall_finalizer_arguments_split_across_deltas():
     """Arguments split across multiple ToolCallDelta events are concatenated."""
     finalizer = ToolCallFinalizer(flush_valid_only=True)

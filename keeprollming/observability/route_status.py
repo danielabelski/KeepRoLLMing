@@ -87,6 +87,22 @@ class RouteStatusRegistry:
                             "phase": "preparing",
                             "stream": None,
                         }
+            elif event.type == "request.lifecycle.admission.queued":
+                self._set_admission_state(event, now, phase="queued")
+            elif event.type == "request.lifecycle.admission.acquired":
+                self._set_admission_state(event, now, phase="preparing")
+            elif event.type == "request.lifecycle.admission.rejected":
+                route_name = self._event_route(event)
+                if route_name:
+                    self._record_error(
+                        route_name,
+                        now,
+                        event.req_id,
+                        event_type=event.type,
+                        message="route admission capacity exceeded",
+                        status=429,
+                    )
+                self._in_flight.pop(event.req_id or "", None)
             elif event.type == "execution.chat.request_route":
                 self._mark_request_started(event, now)
             elif event.type == "execution.streaming.upstream_connect":
@@ -188,6 +204,9 @@ class RouteStatusRegistry:
             return {
                 "activity": activity,
                 "errors": list(reversed(errors)),
+                "queued_requests": self._requests_for_route(
+                    route_name, current, phases={"queued"}
+                ),
                 "pending_requests": self._requests_for_route(
                     route_name, current, phases={"preparing", "connecting"}
                 ),
@@ -226,6 +245,26 @@ class RouteStatusRegistry:
             request["phase"] = "requesting"
         elif request["phase"] == "preparing":
             request["phase"] = "connecting"
+
+    def _set_admission_state(self, event: RuntimeEvent, now: float, *, phase: str) -> None:
+        """Record admission facts that precede normal route-resolution events."""
+        if not event.req_id:
+            return
+        route_name = self._text(event.data.get("route"))
+        if not route_name:
+            return
+        request = self._in_flight.get(event.req_id)
+        if request is None:
+            self._request_routes[event.req_id] = (route_name, now)
+            request = {
+                "route_name": route_name,
+                "started_at": now,
+                "phase": phase,
+                "stream": None,
+            }
+            self._in_flight[event.req_id] = request
+        else:
+            request["phase"] = phase
 
     def _mark_in_flight(self, req_id: str | None, *, phase: str) -> None:
         if not req_id:

@@ -99,3 +99,20 @@ def test_generic_json_projection_redacts_raw_bytes():
         "byte_length": len(b"secret SSE payload"),
         "sha256": hashlib.sha256(b"secret SSE payload").hexdigest(),
     }
+
+
+def test_trace_preserves_upstream_http_error_body_bytes(tmp_path):
+    """A recovered HTTP failure remains replay/debug evidence in a raw trace."""
+    consumer = RawTraceConsumer(policy="all", base_dir=tmp_path)
+    req_id = "trace-upstream-error"
+    consumer(_event("transport.trace.request_started", req_id, {"route": "code/architect"}))
+    body = b'{"error":{"message":"invalid payload"}}'
+    consumer(_event("transport.trace.chunk", req_id, {
+        "direction": "upstream", "boundary": "upstream.error_body", "chunk_index": 0,
+        "monotonic_ns": 10, "relative_ns": 10, "raw_bytes": body,
+    }))
+
+    trace_path = next(tmp_path.rglob("trace.jsonl"))
+    row = json.loads(trace_path.read_text().strip())
+    assert row["boundary"] == "upstream.error_body"
+    assert base64.b64decode(row["bytes_b64"]) == body

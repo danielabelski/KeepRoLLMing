@@ -51,3 +51,10 @@ def test_registry_rejects_unknown_or_wrongly_typed_module_settings():
         validate_filter_module_settings({"timestamp": {"enabled": True, "bogus": 1}})
     with pytest.raises(ValueError, match="model_nudge.max_attempts"):
         validate_filter_module_settings({"model_nudge": {"max_attempts": "three"}})
+
+
+def test_multimodal_validator_rejects_unknown_image_retention_policy():
+    with pytest.raises(ValueError, match="max_images_policy"):
+        validate_filter_module_settings({
+            "multimodal_validator": {"max_images_policy": "keep_everything"},
+        })

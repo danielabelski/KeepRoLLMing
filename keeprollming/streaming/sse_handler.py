@@ -72,6 +72,10 @@ class SSEStreamHandler:
                 if isinstance(c0, dict):
                     delta = c0.get("delta")
                     if isinstance(delta, dict):
+                        if "reasoning" in delta and "reasoning_content" not in delta:
+                            delta = dict(delta)
+                            delta["reasoning_content"] = delta.pop("reasoning")
+                            choices[0]["delta"] = delta
                         has_reasoning = "reasoning_content" in delta
                         has_content = "content" in delta and delta.get("content")
                         
@@ -184,7 +188,8 @@ class SSEStreamHandler:
         
         has_tool_calls = bool(delta.get("tool_calls"))
         has_content = isinstance(delta.get("content"), str) and bool(delta.get("content"))
-        has_reasoning = isinstance(delta.get("reasoning_content"), str) and bool(delta.get("reasoning_content"))
+        reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+        has_reasoning = isinstance(reasoning, str) and bool(reasoning)
         
         emit_role_preface = False
         if not self.role_sent:
@@ -228,6 +233,9 @@ def transform_reasoning_to_content(delta: Dict) -> Dict:
     Returns:
         Transformed delta with reasoning_content converted to content
     """
+    if "reasoning" in delta and "reasoning_content" not in delta:
+        delta = dict(delta)
+        delta["reasoning_content"] = delta.pop("reasoning")
     if "reasoning_content" not in delta or "content" in delta:
         return delta
     

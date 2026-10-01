@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .events import RuntimeEvent
+from .redactor import NoOpRedactor, Redactor, ZeroContentRedactor
 
 
 class RawTraceConsumer:
@@ -26,6 +27,7 @@ class RawTraceConsumer:
         selected_routes: list[str] | None = None,
         base_dir: str | Path | None = None,
         max_bytes_per_request: int = 20 * 1024 * 1024,
+        privacy_mode: bool = False,
     ) -> None:
         if policy not in {"disabled", "all", "selected_routes"}:
             raise ValueError("raw trace policy must be disabled, all, or selected_routes")
@@ -37,6 +39,8 @@ class RawTraceConsumer:
         self._sequence: dict[str, int] = {}
         self._written: dict[str, int] = {}
         self._truncated: set[str] = set()
+        self._privacy_mode = privacy_mode
+        self._redactor: Redactor = ZeroContentRedactor() if privacy_mode else NoOpRedactor()
         # ASGI response-start precedes the lazy body iterator that announces
         # ``request_started``.  Retain a few metadata-only facts until the
         # route is known, then either persist or discard them deterministically.
@@ -75,6 +79,19 @@ class RawTraceConsumer:
         if not isinstance(raw, bytes):
             return
         req_id = event.req_id
+        if self._privacy_mode:
+            self._sequence[req_id] += 1
+            self._write_record(req_id, {
+                "format_version": 1,
+                "sequence": self._sequence[req_id],
+                "req_id": req_id,
+                "kind": "chunk_omitted",
+                "direction": (event.data or {}).get("direction"),
+                "boundary": (event.data or {}).get("boundary"),
+                "chunk_index": (event.data or {}).get("chunk_index"),
+                "byte_length": len(raw),
+            })
+            return
         if self._written[req_id] + len(raw) > self._max_bytes:
             if req_id not in self._truncated:
                 self._truncated.add(req_id)
@@ -109,11 +126,11 @@ class RawTraceConsumer:
             "boundary": data.get("boundary"),
             "monotonic_ns": data.get("monotonic_ns"),
             "timestamp_ns": event.timestamp_ns,
-            "data": {
+            "data": self._redactor.redact({
                 key: value
                 for key, value in data.items()
                 if key not in {"boundary", "monotonic_ns", "raw_bytes"}
-            },
+            }),
         })
 
     def _write_record(self, req_id: str, record: dict[str, Any]) -> None:

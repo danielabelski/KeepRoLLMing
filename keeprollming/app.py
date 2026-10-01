@@ -212,9 +212,15 @@ async def lifespan(app: FastAPI):
 
     # ── O11: Initialize BodyCaptureConsumer for error payload capture ──
     from .observability.body_capture_consumer import BodyCaptureConsumer
+    from .observability.redactor import NoOpRedactor, ZeroContentRedactor
 
+    observability_config = CONFIG.get("observability", {})
+    privacy_mode = bool(observability_config.get("privacy_mode", False))
+    persistence_redactor = ZeroContentRedactor() if privacy_mode else NoOpRedactor()
     body_capture_policy = CONFIG.get("body_capture", {}).get("policy", "errors_only")
-    body_capture_consumer = BodyCaptureConsumer(policy=body_capture_policy)
+    body_capture_consumer = BodyCaptureConsumer(
+        policy=body_capture_policy, redactor=persistence_redactor,
+    )
 
     # Subscribe to execution.* and request.* namespaces for error events
     _event_dispatcher.subscribe("execution.chat", body_capture_consumer)
@@ -230,6 +236,7 @@ async def lifespan(app: FastAPI):
     request_capture_consumer = RequestCaptureConsumer(
         policy=request_capture_policy,
         selected_routes=selected_routes,
+        redactor=persistence_redactor,
     )
 
     # Subscribe to request.capture namespace for raw request capture events
@@ -237,14 +244,15 @@ async def lifespan(app: FastAPI):
 
     # The same RuntimeEvent stream feeds independently configured projections.
     log_dir = os.environ.get("LOG_PATH", ".")
-    observability_config = CONFIG.get("observability", {})
     from .observability.default_projectors import (
         create_default_projectors,
         start_queued_default_projectors,
         stop_queued_default_projectors,
     )
 
-    default_projectors = create_default_projectors(log_dir, observability_config.get("projectors"))
+    default_projectors = create_default_projectors(
+        log_dir, observability_config.get("projectors"), privacy_mode=privacy_mode,
+    )
     projector_queue_size = observability_config.get("projector_queue_size", 2048)
     queued_projectors = await start_queued_default_projectors(
         default_projectors,
@@ -263,6 +271,7 @@ async def lifespan(app: FastAPI):
         selected_routes=raw_trace_config.get("selected_routes"),
         base_dir=raw_trace_path,
         max_bytes_per_request=raw_trace_config.get("max_bytes_per_request", 20 * 1024 * 1024),
+        privacy_mode=privacy_mode,
     )
     _event_dispatcher.subscribe("transport.trace", raw_trace_consumer)
 
@@ -639,9 +648,11 @@ async def get_routes_status():
     """Return private, dashboard-oriented state for all public configured routes."""
     from . import config as runtime_config
     from .config import resolve_route_settings
+    from .circuit_breaker import get_circuit_breaker_registry
     from .routing.router import resolve_inherited_route
 
     registry = get_route_status_registry()
+    circuit_registry = get_circuit_breaker_registry()
     routes_by_name = {route.name: route for route in runtime_config.USER_ROUTES}
     routes: list[dict[str, Any]] = []
     for route in sorted(runtime_config.USER_ROUTES, key=lambda item: item.name):
@@ -657,6 +668,7 @@ async def get_routes_status():
         status = registry.snapshot(route.name) if registry is not None else {
             "activity": [],
             "errors": [],
+            "queued_requests": [],
             "pending_requests": [],
             "active_requests": [],
             "performance": {
@@ -675,6 +687,20 @@ async def get_routes_status():
             "capabilities": list(resolved.capabilities or []),
             "ctx_len": ctx_len,
             "max_tokens": max_tokens,
+            "admission": {
+                "max_concurrent": resolved.max_concurrent,
+                "queue_timeout_ms": (
+                    round(float(resolved.queue_timeout) * 1000.0)
+                    if resolved.queue_timeout is not None
+                    else 0
+                ),
+            },
+            "circuit_breaker": {
+                "enabled": bool(resolved.circuit_breaker_enabled),
+                "failure_threshold": resolved.failure_threshold,
+                "recovery_timeout_ms": round(float(resolved.recovery_timeout) * 1000.0),
+                **circuit_registry.snapshot(route.name),
+            },
             **status,
         })
 

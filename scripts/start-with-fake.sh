@@ -50,7 +50,7 @@ echo "Fake backend PID: $FAKE_PID"
 # Set a default scenario
 curl -s -X POST "http://127.0.0.1:$FAKE_PORT/__scenario" \
     -H "Content-Type: application/json" \
-    -d '{"chat_content": "FAKE OK"}' > /dev/null
+    -d '{"scenario":{"chat":{"content":["FAKE OK"],"stream_pieces":[["FAKE OK"]]}}}' > /dev/null
 
 # Generate temporary config pointing to fake backend
 FAKE_CONFIG="/tmp/keeprollming_fake_config_$$.yaml"

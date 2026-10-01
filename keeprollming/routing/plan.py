@@ -10,7 +10,7 @@ streaming and non-streaming paths from independently re-reading a mutable
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any, Mapping
 
@@ -55,7 +55,7 @@ class RoutePlan:
     filters: Mapping[str, Any]
     enabled_filters: tuple[str, ...]
     capabilities: tuple[str, ...]
-    fallback_attempts: tuple[tuple[Any, str], ...]
+    fallback_attempts: tuple["UpstreamAttempt", ...]
     overrides: Mapping[str, Any]
 
     @classmethod
@@ -69,6 +69,8 @@ class RoutePlan:
         context_window: int,
         default_max_tokens: int,
         upstream_url: str,
+        routes_by_name: Mapping[str, Any] | None = None,
+        defaults: Any = None,
     ) -> "RoutePlan":
         """Compile route-derived runtime decisions after route resolution."""
         from ..orchestrator.pipeline import Pipeline
@@ -78,6 +80,24 @@ class RoutePlan:
         base_url = normalized_url[:-3] if normalized_url.endswith("/v1") else normalized_url
         frozen_filters = _freeze(settings.filters or {})
         mutable_filters = _thaw(frozen_filters)
+        resolved_attempts = [
+            UpstreamAttempt.from_route(candidate_route, candidate_model, defaults)
+            for candidate_route, candidate_model in resolve_fallback_chain(
+                route,
+                settings.upstream_model,
+                routes_by_name=dict(routes_by_name or {}),
+                defaults=defaults,
+            )
+        ]
+        # ``upstream_url`` has already incorporated endpoint-level root/env
+        # fallback rules. Keep the primary plan aligned with that decision.
+        primary_base = normalized_url[:-3] if normalized_url.endswith("/v1") else normalized_url
+        if resolved_attempts:
+            resolved_attempts[0] = replace(
+                resolved_attempts[0],
+                upstream_url=normalized_url,
+                endpoint_url=f"{primary_base}/v1/chat/completions",
+            )
         return cls(
             route=route,
             client_model=client_model,
@@ -93,7 +113,7 @@ class RoutePlan:
             filters=frozen_filters,
             enabled_filters=tuple(Pipeline.enabled_filter_names(mutable_filters)),
             capabilities=tuple(settings.capabilities),
-            fallback_attempts=tuple(resolve_fallback_chain(route, settings.upstream_model)),
+            fallback_attempts=tuple(resolved_attempts),
             overrides=_freeze(getattr(route, "overrides", {}) or {}),
         )
 
@@ -130,3 +150,36 @@ class RoutePlan:
     def request_timeout(self) -> float:
         """Resolved upstream timeout for this request."""
         return self.settings.request_timeout
+
+
+@dataclass(frozen=True)
+class UpstreamAttempt:
+    """One fully resolved upstream retry target for a request."""
+
+    route: Any
+    route_name: str
+    model: str
+    upstream_url: str
+    endpoint_url: str
+    upstream_headers: Mapping[str, str]
+    request_timeout: float
+
+    @classmethod
+    def from_route(cls, route: Any, model: str, defaults: Any = None) -> "UpstreamAttempt":
+        from .router import get_route_settings
+
+        settings = get_route_settings(route, model, defaults=defaults)
+        upstream_url = (settings.upstream_url or "").rstrip("/")
+        base_url = upstream_url[:-3] if upstream_url.endswith("/v1") else upstream_url
+        headers = dict(settings.upstream_headers)
+        if settings.api_key and "Authorization" not in headers:
+            headers["Authorization"] = f"Bearer {settings.api_key}"
+        return cls(
+            route=route,
+            route_name=settings.route_name or getattr(route, "name", ""),
+            model=model,
+            upstream_url=upstream_url,
+            endpoint_url=f"{base_url}/v1/chat/completions",
+            upstream_headers=MappingProxyType(headers),
+            request_timeout=settings.request_timeout,
+        )

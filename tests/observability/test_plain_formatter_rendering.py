@@ -515,18 +515,62 @@ class TestRetriesNudgesRendering:
         assert "delay_ms=100" in result
 
     def test_fallback_shows_model_transition(self):
-        """Fallback event shows model transition."""
+        """Fallback rendering identifies route, endpoint, attempt and cause."""
         formatter = PlainTextFormatter()
         event = _make_event(
             "execution.chat.fallback",
-            {"from_model": "gpt-4", "to_model": "gpt-3.5-turbo"},
+            {
+                "from_route": "chat/main", "from_model": "gpt-4",
+                "from_upstream_url": "http://primary:8000/v1/chat/completions",
+                "to_route": "chat/remote", "to_model": "gpt-3.5-turbo",
+                "to_upstream_url": "http://secondary:9000/v1/chat/completions",
+                "attempt": 1, "total_attempts": 2, "reason": "http_status",
+                "status": 404, "error": "model not found",
+            },
             domain="execution",
             component="chat",
         )
         result = formatter.format(event)
-        assert "execution.fallback" in result
+        assert "execution.chat.fallback" in result
+        assert "attempt=1/2" in result
+        assert "reason=http_status" in result
+        assert "status=404" in result
+        assert "route=chat/main" in result
+        assert "route=chat/remote" in result
         assert "gpt-4" in result
         assert "gpt-3.5-turbo" in result
+
+    def test_fallback_chain_shows_resolved_attempts(self):
+        formatter = PlainTextFormatter()
+        event = _make_event(
+            "execution.chat.fallback_chain",
+            {"attempts": [
+                {"position": 1, "route": "chat/main", "model": "main", "upstream_url": "http://main:8000/v1/chat/completions", "timeout_s": 30},
+                {"position": 2, "route": "chat/alt", "model": "alt", "upstream_url": "http://alt:9000/v1/chat/completions", "timeout_s": 45},
+            ]},
+            domain="execution", component="chat",
+        )
+        result = formatter.format(event)
+        assert "execution.chat.fallback_chain attempts=2" in result
+        assert "[1] route=chat/main" in result
+        assert "[2] route=chat/alt" in result
+
+    def test_recovered_upstream_error_shows_body_and_attempt(self):
+        formatter = PlainTextFormatter()
+        event = _make_event(
+            "execution.chat.upstream_error",
+            {
+                "status": 400, "route": "code/architect",
+                "url": "http://primary:7901/v1/chat/completions",
+                "body": '{"error":{"message":"invalid payload"}}',
+                "recovered": True, "attempt": 1, "total_attempts": 2,
+            },
+            domain="execution", component="chat",
+        )
+        result = formatter.format(event)
+        assert "recovered_by_fallback=true" in result
+        assert "attempt=1/2" in result
+        assert "invalid payload" in result
 
 
 class TestUsageTokensRendering:

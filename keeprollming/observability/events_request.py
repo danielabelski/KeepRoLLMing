@@ -145,3 +145,42 @@ def emit_auth_rejected(
         credential_present=credential_present,
         dispatcher=dispatcher,
     )
+
+
+def emit_admission_queued(
+    req_id: str, *, route: str, max_concurrent: int, queue_timeout_ms: int,
+    dispatcher: Optional[Any] = None,
+) -> None:
+    return emit_request_event(
+        req_id, "request.lifecycle.admission.queued", route=route,
+        max_concurrent=max_concurrent, queue_timeout_ms=queue_timeout_ms,
+        dispatcher=dispatcher,
+    )
+
+
+def emit_admission_acquired(
+    req_id: str, *, route: str, max_concurrent: int, waited: bool,
+    dispatcher: Optional[Any] = None,
+) -> None:
+    return emit_request_event(
+        req_id, "request.lifecycle.admission.acquired", route=route,
+        max_concurrent=max_concurrent, waited=waited, dispatcher=dispatcher,
+    )
+
+
+def emit_admission_rejected(
+    req_id: str, *, route: str, max_concurrent: int, queue_timeout_ms: int,
+    dispatcher: Optional[Any] = None,
+) -> None:
+    return emit_request_event(
+        req_id, "request.lifecycle.admission.rejected", level="WARN", route=route,
+        max_concurrent=max_concurrent, queue_timeout_ms=queue_timeout_ms,
+        dispatcher=dispatcher,
+    )
+
+
+def emit_admission_released(route: str, *, dispatcher: Optional[Any] = None) -> None:
+    return emit_request_event(
+        "-", "request.lifecycle.admission.released", route=route,
+        dispatcher=dispatcher,
+    )

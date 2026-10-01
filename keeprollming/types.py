@@ -139,6 +139,11 @@ class Route:
     request_timeout: float | None = None
     request_timeout_inherited: bool = False  # Track if timeout was inherited from parent
 
+    # Route-level work admission. ``None`` means unlimited; a positive value
+    # caps concurrent logical requests before they consume upstream capacity.
+    max_concurrent: int | None = None
+    queue_timeout: float | None = None
+
     # Performance logs directory override for this route (optional)
     performance_logs_dir: Optional[str] = None
 

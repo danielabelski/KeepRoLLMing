@@ -45,7 +45,7 @@ def _conversation_context(
         raw_calls = message.get("tool_calls")
         if isinstance(raw_calls, list):
             tool_calls.extend(call for call in raw_calls if isinstance(call, Mapping))
-        reasoning = message.get("reasoning_content")
+        reasoning = message.get("reasoning_content") or message.get("reasoning")
         if isinstance(reasoning, str) and reasoning:
             last_reasoning = reasoning
     return tool_calls, last_reasoning
@@ -66,7 +66,25 @@ def build_finalizers(
     conversation_tool_calls, conversation_reasoning = _conversation_context(
         conversation_messages
     )
-    finalizers: list[StreamFinalizer] = [ToolCallFinalizer(flush_valid_only=True)]
+    # Direct streams and exact-mode TLS can preserve native tool-call delta
+    # cadence. RLS and fuzzy/AB TLS still need terminal attempt isolation
+    # until their prefix/recovery contracts are similarly scoped.
+    tls_config = _enabled(config, "model_tool_loop_stopper")
+    progressive_exact_tls = (
+        tls_config is not None
+        and tls_config.get("fuzzy_threshold") is None
+        and tls_config.get("ab_loop_detection", False) is False
+    )
+    recovery_requires_terminal_tool_buffering = (
+        _enabled(config, "reasoning_loop_stopper") is not None
+        or (tls_config is not None and not progressive_exact_tls)
+    )
+    finalizers: list[StreamFinalizer] = [
+        ToolCallFinalizer(
+            flush_valid_only=True,
+            stream_deltas=not recovery_requires_terminal_tool_buffering,
+        )
+    ]
 
     timestamp = _enabled(config, "timestamp")
     if timestamp is not None:
@@ -124,6 +142,7 @@ def build_finalizers(
                     tls.get("fallback_message"),
                 ),
                 conversation_tool_calls=conversation_tool_calls,
+                progressive_exact=progressive_exact_tls,
             )
         )
 

@@ -37,6 +37,13 @@ routes:
     pattern: "local/quick"
     request_timeout: 2.0
 
+  internal/admission:
+    extends: base/quick
+    pattern: "internal/admission"
+    summary_enabled: false
+    max_concurrent: 1
+    queue_timeout: 0
+
   # Main route
   local/main:
     extends: base/main
@@ -111,6 +118,19 @@ routes:
         enabled: true
         prompt: "/nothink reply in french"
         override: false
+
+  # Exact TLS has no fuzzy or A/B heuristics, so a clearly distinct tool name
+  # can be released before the upstream terminal frame.
+  internal/exact-tls:
+    pattern: "internal/exact-tls"
+    model: "test-main-model"
+    summary_enabled: false
+    ctx_len: 2048
+    max_tokens: 1024
+    filters:
+      model_tool_loop_stopper:
+        enabled: true
+        max_attempts: 1
 
   internal/full:
     pattern: "internal/full"

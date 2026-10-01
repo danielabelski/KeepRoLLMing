@@ -22,6 +22,7 @@ from typing import List, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import httpx
 
 from keeprollming.observability.events import EventSource, RuntimeEvent
 from keeprollming.observability.dispatcher import EventDispatcher
@@ -141,6 +142,247 @@ class TestStreamingErrorPathMetricsEmission:
             print(f"  - completion_tokens_source: {data['completion_tokens_source']}")
             print(f"  - stream: {data['stream']}")
             print(f"  - elapsed_ms: {data['elapsed_ms']:.2f}ms")
+
+        asyncio.run(run_test())
+
+    def test_pre_output_connect_failure_retries_route_aware_fallback(self):
+        """A refused primary stream reaches the fallback endpoint before SSE output."""
+        from keeprollming.endpoints.streaming_handlers import process_streaming_request
+        from keeprollming.routing import Route, UpstreamAttempt
+
+        async def run_test():
+            dispatcher = EventDispatcher()
+            captured_events: List[RuntimeEvent] = []
+            dispatcher.subscribe("execution", captured_events.append)
+
+            class RefusedStream:
+                async def __aenter__(self):
+                    raise httpx.ConnectError("primary refused")
+
+                async def __aexit__(self, *args):
+                    return None
+
+            class FallbackStream:
+                status_code = 200
+                headers = {"content-type": "text/event-stream"}
+                extensions = {}
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *args):
+                    return None
+
+                async def aiter_bytes(self):
+                    yield b'data: {"choices":[{"delta":{"role":"assistant","content":"fallback ok"},"finish_reason":null}]}\n\n'
+                    yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+                    yield b"data: [DONE]\n\n"
+
+            calls = []
+
+            class Client:
+                def stream(self, _method, target_url, **_kwargs):
+                    calls.append(target_url)
+                    return RefusedStream() if "primary" in target_url else FallbackStream()
+
+            primary = Route(name="primary", pattern="primary", model="primary-model")
+            secondary = Route(name="secondary", pattern="secondary", model="secondary-model")
+            fallback = UpstreamAttempt(
+                route=secondary, route_name="secondary", model="secondary-model",
+                upstream_url="http://secondary:9000",
+                endpoint_url="http://secondary:9000/v1/chat/completions",
+                upstream_headers={}, request_timeout=10.0,
+            )
+            chunks = []
+            async for chunk in process_streaming_request(
+                url="http://primary:8000/v1/chat/completions",
+                client=Client(), payload={"model": "primary-model", "messages": [], "stream": True},
+                route_headers={}, route=primary, req_id="fallback-stream", request_timeout=10.0,
+                fallback_attempts=[object(), fallback], visited_models=None,
+                upstream_model="primary-model", is_passthrough=False,
+                transform_reasoning_content=False, add_empty_content_when_reasoning_only=False,
+                reasoning_placeholder="", t_start=0.0, dispatcher=dispatcher,
+            ):
+                chunks.append(chunk)
+
+            assert calls == [
+                "http://primary:8000/v1/chat/completions",
+                "http://secondary:9000/v1/chat/completions",
+            ]
+            assert b"fallback ok" in b"".join(chunks)
+            fallbacks = [event for event in captured_events if event.type == "execution.chat.fallback"]
+            assert len(fallbacks) == 1
+            decision = fallbacks[0].data
+            assert decision["from_route"] == "primary"
+            assert decision["from_model"] == "primary-model"
+            assert decision["from_upstream_url"] == "http://primary:8000/v1/chat/completions"
+            assert decision["to_route"] == "secondary"
+            assert decision["to_model"] == "secondary-model"
+            assert decision["to_upstream_url"] == "http://secondary:9000/v1/chat/completions"
+            assert decision["attempt"] == 1
+            assert decision["total_attempts"] == 2
+            assert decision["reason"] == "transport_error"
+            assert decision["error_type"] == "ConnectError"
+
+        asyncio.run(run_test())
+
+    def test_pre_output_http_error_records_route_aware_fallback(self):
+        """An upstream HTTP failure captures its cause before retrying the next route."""
+        from keeprollming.endpoints.streaming_handlers import process_streaming_request
+        from keeprollming.routing import Route, UpstreamAttempt
+
+        async def run_test():
+            dispatcher = EventDispatcher()
+            captured_events: List[RuntimeEvent] = []
+            dispatcher.subscribe("execution", captured_events.append)
+
+            class PrimaryFailure:
+                status_code = 404
+                headers = {"content-type": "application/json"}
+                extensions = {}
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *args):
+                    return None
+
+                async def aread(self):
+                    return b'{"error":{"code":"model_not_found","message":"unknown model"}}'
+
+            class FallbackStream:
+                status_code = 200
+                headers = {"content-type": "text/event-stream"}
+                extensions = {}
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *args):
+                    return None
+
+                async def aiter_bytes(self):
+                    yield b'data: {"choices":[{"delta":{"content":"fallback ok"},"finish_reason":null}]}\n\n'
+                    yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+                    yield b"data: [DONE]\n\n"
+
+            class Client:
+                def stream(self, _method, target_url, **_kwargs):
+                    return PrimaryFailure() if "primary" in target_url else FallbackStream()
+
+            primary = Route(name="primary", pattern="primary", model="primary-model")
+            secondary = Route(name="secondary", pattern="secondary", model="secondary-model")
+            fallback = UpstreamAttempt(
+                route=secondary, route_name="secondary", model="secondary-model",
+                upstream_url="http://secondary:9000",
+                endpoint_url="http://secondary:9000/v1/chat/completions",
+                upstream_headers={}, request_timeout=10.0,
+            )
+            chunks = []
+            async for chunk in process_streaming_request(
+                url="http://primary:8000/v1/chat/completions", client=Client(),
+                payload={"model": "primary-model", "messages": [], "stream": True},
+                route_headers={}, route=primary, req_id="fallback-http", request_timeout=10.0,
+                fallback_attempts=[object(), fallback], visited_models=None,
+                upstream_model="primary-model", is_passthrough=False,
+                transform_reasoning_content=False, add_empty_content_when_reasoning_only=False,
+                reasoning_placeholder="", t_start=0.0, dispatcher=dispatcher,
+            ):
+                chunks.append(chunk)
+
+            assert b"fallback ok" in b"".join(chunks)
+            fallback_event = next(
+                event for event in captured_events if event.type == "execution.chat.fallback"
+            )
+            assert fallback_event.data == {
+                "from_route": "primary", "from_model": "primary-model",
+                "from_upstream_url": "http://primary:8000/v1/chat/completions",
+                "from_timeout_s": 10.0,
+                "to_route": "secondary", "to_model": "secondary-model",
+                "to_upstream_url": "http://secondary:9000/v1/chat/completions",
+                "to_timeout_s": 10.0,
+                "attempt": 1, "total_attempts": 2, "reason": "http_status",
+                "status": 404, "error_type": None,
+                "error": '{"error":{"code":"model_not_found","message":"unknown model"}}',
+            }
+            recovered_error = next(
+                event for event in captured_events if event.type == "execution.chat.upstream_error"
+            )
+            assert recovered_error.level == "BASIC"
+            assert recovered_error.data["recovered"] is True
+            assert recovered_error.data["attempt"] == 1
+            assert recovered_error.data["total_attempts"] == 2
+            assert recovered_error.data["body"] == fallback_event.data["error"]
+
+        asyncio.run(run_test())
+
+    def test_pre_output_client_error_is_not_retried(self):
+        """A 400 context error is delivered downstream without a fallback."""
+        from keeprollming.endpoints.streaming_handlers import process_streaming_request
+        from keeprollming.routing import Route, UpstreamAttempt
+
+        async def run_test():
+            dispatcher = EventDispatcher()
+            captured_events: List[RuntimeEvent] = []
+            dispatcher.subscribe("execution", captured_events.append)
+            calls: list[str] = []
+            error_body = (
+                b'{"error":{"message":"maximum context length exceeded",'
+                b'"type":"BadRequestError","param":"input_tokens","code":400}}'
+            )
+
+            class ClientError:
+                status_code = 400
+                headers = {"content-type": "application/json"}
+                extensions = {}
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *args):
+                    return None
+
+                async def aread(self):
+                    return error_body
+
+            class Client:
+                def stream(self, _method, target_url, **_kwargs):
+                    calls.append(target_url)
+                    return ClientError()
+
+            primary = Route(name="primary", pattern="primary", model="primary-model")
+            secondary = Route(name="secondary", pattern="secondary", model="secondary-model")
+            fallback = UpstreamAttempt(
+                route=secondary, route_name="secondary", model="secondary-model",
+                upstream_url="http://secondary:9000",
+                endpoint_url="http://secondary:9000/v1/chat/completions",
+                upstream_headers={}, request_timeout=10.0,
+            )
+            chunks = []
+            async for chunk in process_streaming_request(
+                url="http://primary:8000/v1/chat/completions", client=Client(),
+                payload={"model": "primary-model", "messages": [], "stream": True},
+                route_headers={}, route=primary, req_id="client-error-stream", request_timeout=10.0,
+                fallback_attempts=[object(), fallback], visited_models=None,
+                upstream_model="primary-model", is_passthrough=False,
+                transform_reasoning_content=False, add_empty_content_when_reasoning_only=False,
+                reasoning_placeholder="", t_start=0.0, dispatcher=dispatcher,
+            ):
+                chunks.append(chunk)
+
+            assert calls == ["http://primary:8000/v1/chat/completions"]
+            response = b"".join(chunks)
+            # OpenAI SSE-compatible error payload followed by the terminal marker.
+            assert response.startswith(b"data: {")
+            sse_payload = response.split(b"\n\n", 1)[0][len(b"data: "):]
+            assert json.loads(sse_payload) == json.loads(error_body)
+            assert not [event for event in captured_events if event.type == "execution.chat.fallback"]
+            upstream_error = next(
+                event for event in captured_events
+                if event.type == "execution.chat.upstream_error"
+            )
+            assert upstream_error.data.get("recovered", False) is False
+            assert upstream_error.data["body"] == error_body.decode()
 
         asyncio.run(run_test())
 

@@ -146,6 +146,73 @@ def test_tls_no_loop_passthrough():
     assert tls.has_tool_call is True
 
 
+def test_progressive_exact_tls_releases_distinct_tool_name_immediately():
+    """Exact TLS need not hold a call whose name excludes a duplicate."""
+    tls = TLSFinalizer(
+        progressive_exact=True,
+        conversation_tool_calls=[{
+            "id": "previous-write",
+            "function": {"name": "write_file", "arguments": '{"path":"a"}'},
+        }],
+    )
+    delta = ToolCallDelta(
+        index=0,
+        id="current-read",
+        name="read_file",
+        arguments_delta='{"path":"README.md"}',
+    )
+
+    assert tls.process_event(delta) == [delta]
+    assert tls.finalize() == []
+    assert tls.decision is None
+    assert tls.allows_live_output is True
+
+
+def test_progressive_exact_tls_holds_same_name_until_arguments_differ():
+    """A same-name call is released only after its canonical args are safe."""
+    tls = TLSFinalizer(
+        progressive_exact=True,
+        conversation_tool_calls=[{
+            "id": "previous-read",
+            "function": {"name": "read_file", "arguments": '{"path":"a"}'},
+        }],
+    )
+    first = ToolCallDelta(
+        index=0,
+        id="current-read",
+        name="read_file",
+        arguments_delta='{"path":"',
+    )
+    second = ToolCallDelta(index=0, arguments_delta='b"}')
+
+    assert tls.process_event(first) == []
+    assert tls.process_event(second) == []
+    assert tls.finalize() == [first, second]
+    assert tls.decision is None
+
+
+def test_progressive_exact_tls_rejects_duplicate_before_commit():
+    """An exact duplicate remains invisible until TLS asks for intervention."""
+    tls = TLSFinalizer(
+        progressive_exact=True,
+        conversation_tool_calls=[{
+            "id": "previous-read",
+            "function": {"name": "read_file", "arguments": '{"path":"a"}'},
+        }],
+    )
+    duplicate = ToolCallDelta(
+        index=0,
+        id="current-read",
+        name="read_file",
+        arguments_delta='{"path":"a"}',
+    )
+
+    assert tls.process_event(duplicate) == []
+    assert tls.finalize() == []
+    assert tls.decision is not None
+    assert tls.decision.origin_finalizer == "TLSFinalizer"
+
+
 def test_tls_no_tool_calls_passthrough():
     """No tool calls at all — should not trigger loop detection.
 

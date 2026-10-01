@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import time
 from typing import Any, Dict, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 from .events import EventSource, RuntimeEvent
 
@@ -220,13 +221,65 @@ def emit_repacked(
                          dispatcher=dispatcher)
 
 
+def _safe_upstream_url(value: Any) -> str:
+    """Return an endpoint identity without query strings or credentials."""
+    text = str(value or "")
+    if not text:
+        return ""
+    try:
+        parsed = urlsplit(text)
+        if not parsed.scheme or not parsed.netloc:
+            return text.split("?", 1)[0]
+        host = parsed.hostname or ""
+        port = f":{parsed.port}" if parsed.port is not None else ""
+        return urlunsplit((parsed.scheme, f"{host}{port}", parsed.path, "", ""))
+    except (TypeError, ValueError):
+        return text.split("?", 1)[0]
+
+
+def describe_fallback_attempt(attempt: Any, position: int | None = None) -> Dict[str, Any]:
+    """Return non-secret, serializable identity fields for one upstream attempt."""
+    if isinstance(attempt, dict):
+        get = attempt.get
+        route = get("route") or get("route_name") or ""
+        model = get("model") or ""
+        url = get("upstream_url") or get("endpoint_url") or get("url") or ""
+        timeout = get("request_timeout", get("timeout_s"))
+    else:
+        route = getattr(attempt, "route_name", "") or getattr(
+            getattr(attempt, "route", None), "name", ""
+        )
+        model = getattr(attempt, "model", "")
+        url = getattr(attempt, "endpoint_url", "") or getattr(attempt, "upstream_url", "")
+        timeout = getattr(attempt, "request_timeout", None)
+    result: Dict[str, Any] = {
+        "route": str(route or ""),
+        "model": str(model or ""),
+        "upstream_url": _safe_upstream_url(url),
+    }
+    if position is not None:
+        result["position"] = position
+    if timeout is not None:
+        result["timeout_s"] = timeout
+    return result
+
+
 def emit_fallback_chain(
-    req_id: str, chain: Any, primary_model: str,
+    req_id: str, configured_chain: Any, attempts: Any,
     dispatcher: Optional[Any] = None,
 ) -> None:
-    return emit_execution_event(req_id, "execution.chat.fallback_chain",
-                         chain=chain, primary_model=primary_model,
-                         dispatcher=dispatcher)
+    """Record the effective, non-secret retry plan before its first attempt."""
+    attempt_list = [describe_fallback_attempt(item, index)
+                    for index, item in enumerate(attempts or [], start=1)]
+    primary = attempt_list[0] if attempt_list else {}
+    return emit_execution_event(
+        req_id, "execution.chat.fallback_chain",
+        configured_chain=list(configured_chain or []),
+        primary_route=primary.get("route", ""),
+        primary_model=primary.get("model", ""),
+        attempts=attempt_list,
+        dispatcher=dispatcher,
+    )
 
 
 def emit_request_start(
@@ -251,23 +304,57 @@ def emit_upstream_error(
     req_id: str, status: int, url: str, route: str,
     upstream_model: str, body: str,
     request_payload: Optional[Any] = None,
+    *,
+    recovered: bool = False,
+    attempt: int | None = None,
+    total_attempts: int | None = None,
     dispatcher: Optional[Any] = None,
 ) -> None:
-    return emit_execution_event(req_id, "execution.chat.upstream_error",
-                         level="ERROR",
-                         status=status, url=url, route=route,
-                         upstream_model=upstream_model,
-                         body=body, request_payload=request_payload,
-                         dispatcher=dispatcher)
+    """Record an upstream HTTP error, including one recovered by fallback.
+
+    A recovered error still explains why the selected fallback was used and
+    lets errors-only body capture retain the rejected request and response.
+    It is BASIC rather than ERROR because a later attempt served the client,
+    but it must remain visible in the standard operational projection.
+    """
+    data: Dict[str, Any] = {
+        "status": status,
+        "url": url,
+        "route": route,
+        "upstream_model": upstream_model,
+        "body": body,
+        "request_payload": request_payload,
+    }
+    if recovered:
+        data.update(recovered=True, attempt=attempt, total_attempts=total_attempts)
+    return emit_execution_event(
+        req_id, "execution.chat.upstream_error",
+        level="BASIC" if recovered else "ERROR", dispatcher=dispatcher, **data,
+    )
 
 
 def emit_fallback(
-    req_id: str, from_model: str, to_model: str,
-    dispatcher: Optional[Any] = None,
+    req_id: str, from_attempt: Any, to_attempt: Any, *,
+    reason: str, attempt: int, total_attempts: int,
+    status: int | None = None, error_type: str | None = None,
+    error: str | None = None, dispatcher: Optional[Any] = None,
 ) -> None:
-    return emit_execution_event(req_id, "execution.chat.fallback",
-                         from_model=from_model, to_model=to_model,
-                         dispatcher=dispatcher)
+    """Record the causal transition from a failed attempt to its successor."""
+    source = describe_fallback_attempt(from_attempt, attempt)
+    target = describe_fallback_attempt(to_attempt, attempt + 1)
+    return emit_execution_event(
+        req_id, "execution.chat.fallback",
+        from_route=source["route"], from_model=source["model"],
+        from_upstream_url=source["upstream_url"],
+        from_timeout_s=source.get("timeout_s"),
+        to_route=target["route"], to_model=target["model"],
+        to_upstream_url=target["upstream_url"],
+        to_timeout_s=target.get("timeout_s"),
+        attempt=attempt, total_attempts=total_attempts, reason=reason,
+        status=status, error_type=error_type,
+        error=(str(error)[:1000] if error else None),
+        dispatcher=dispatcher,
+    )
 
 
 def emit_pipeline_error(

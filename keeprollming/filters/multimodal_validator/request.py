@@ -60,6 +60,10 @@ class MultimodalValidatorFilter(Filter):
             Maximum number of image_url items allowed in a single request.
             When exceeded, excess images are removed and replaced with a
             text placeholder. 0 = no limit.
+        max_images_policy: "strip_first" | "strip_latest" (default: "strip_first")
+            Selects which excess images are removed. ``strip_first`` removes
+            the oldest images and retains the most recent ones; ``strip_latest``
+            removes the newest images and retains the oldest ones.
         max_images_replacement_text: str (default: "[Image omitted due to limit]")
             Text inserted in place of stripped image_url items when
             max_images is exceeded.
@@ -82,6 +86,12 @@ class MultimodalValidatorFilter(Filter):
             patterns_raw = config.get("marker_patterns", _DEFAULT_MARKER_PATTERNS)
             self._log_level = config.get("log_level", "WARN").upper()
             self._max_images = config.get("max_images", 0)
+            self._max_images_policy = config.get("max_images_policy", "strip_first")
+            if self._max_images_policy not in {"strip_first", "strip_latest"}:
+                raise ValueError(
+                    "multimodal_validator.max_images_policy must be "
+                    "'strip_first' or 'strip_latest'"
+                )
             self._max_images_replacement = config.get(
                 "max_images_replacement_text",
                 "[Image omitted due to limit]",
@@ -95,6 +105,7 @@ class MultimodalValidatorFilter(Filter):
             patterns_raw = _DEFAULT_MARKER_PATTERNS
             self._log_level = "WARN"
             self._max_images = 0
+            self._max_images_policy = "strip_first"
             self._max_images_replacement = "[Image omitted due to limit]"
             self._strip_all = False
 
@@ -132,6 +143,7 @@ class MultimodalValidatorFilter(Filter):
                         req_id=req_id,
                         total_images=total_images,
                         max_images=self._max_images,
+                        max_images_policy=self._max_images_policy,
                         stripped=stripped,
                     )
 
@@ -189,59 +201,53 @@ class MultimodalValidatorFilter(Filter):
     def _enforce_max_images(self, messages: List[Dict[str, Any]]) -> int:
         """Enforce max_images limit by removing excess image_url items.
 
-        Images are stripped from the **end** of the message list (most recent
-        tool call results) to minimize context disruption. Each stripped
-        image_url item is replaced with a text placeholder so the message
-        structure is preserved.
+        ``strip_first`` (the default) removes the oldest image parts and keeps
+        the newest ``max_images``. ``strip_latest`` retains the historical
+        behavior: keep the oldest ``max_images`` and remove newer parts. Each
+        stripped image_url item is replaced with a text placeholder so the
+        message structure is preserved.
 
         Returns the number of image_url items stripped.
         """
-        # Count total images first, then compute how many to strip
-        remaining = self._max_images
-        stripped = 0
-
-        # First pass: count down remaining, keeping track of what to strip
-        for msg in messages:
+        image_positions: List[tuple[int, int]] = []
+        for message_index, msg in enumerate(messages):
             content = msg.get("content")
             if not isinstance(content, list):
                 continue
-            for item in content:
+            for item_index, item in enumerate(content):
                 if isinstance(item, dict) and item.get("type") == "image_url":
-                    if remaining > 0:
-                        remaining -= 1
-                    else:
-                        stripped += 1
+                    image_positions.append((message_index, item_index))
 
-        if stripped == 0:
+        excess = len(image_positions) - self._max_images
+        if excess <= 0:
             return 0
 
-        # Second pass: actually strip the excess
-        remaining = self._max_images
-        for msg in messages:
+        if self._max_images_policy == "strip_first":
+            positions_to_strip = set(image_positions[:excess])
+        else:
+            positions_to_strip = set(image_positions[self._max_images:])
+
+        for message_index, msg in enumerate(messages):
             content = msg.get("content")
             if not isinstance(content, list):
                 continue
 
             new_content: List[Dict[str, Any]] = []
-            for item in content:
+            for item_index, item in enumerate(content):
                 if not isinstance(item, dict):
                     new_content.append(item)
                     continue
-                if item.get("type") == "image_url":
-                    if remaining > 0:
-                        remaining -= 1
-                        new_content.append(item)
-                    else:
-                        new_content.append({
-                            "type": "text",
-                            "text": self._max_images_replacement,
-                        })
+                if (message_index, item_index) in positions_to_strip:
+                    new_content.append({
+                        "type": "text",
+                        "text": self._max_images_replacement,
+                    })
                 else:
                     new_content.append(item)
 
             msg["content"] = new_content
 
-        return stripped
+        return excess
 
     def _count_image_parts(self, content: List[Dict[str, Any]]) -> int:
         """Count image_url items in a list-type content field."""

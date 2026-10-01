@@ -505,8 +505,8 @@ class TestMaxImagesEnforcement:
             assert m["content"][0]["type"] == "image_url"
 
     @pytest.mark.asyncio
-    async def test_exceeds_limit_strips_latest(self):
-        """Images exceed limit → latest images stripped, replaced with text."""
+    async def test_exceeds_limit_defaults_to_stripping_oldest(self):
+        """The default policy retains recent images and strips the oldest."""
         f = MultimodalValidatorFilter(config={"max_images": 2})
         msgs = [
             {"role": "tool", "content": [dict(_TYPICAL_IMAGE_URL, _image_note="img1")]},
@@ -519,16 +519,34 @@ class TestMaxImagesEnforcement:
         msgs[2]["content"][0]["_note"] = "img3"
         req = MockRequest(messages=msgs)
         result = await f.process_request(req, _make_context())
-        # First 2 images preserved (oldest), last one replaced
+        # The oldest image is replaced; the newest two are preserved.
+        assert result.messages[0]["content"][0]["type"] == "text"
+        assert "[Image omitted" in result.messages[0]["content"][0]["text"]
+        assert result.messages[1]["content"][0]["type"] == "image_url"
+        assert result.messages[2]["content"][0]["type"] == "image_url"
+
+    @pytest.mark.asyncio
+    async def test_strip_latest_retains_oldest_images(self):
+        """The explicit compatibility policy strips newer image parts."""
+        f = MultimodalValidatorFilter(config={
+            "max_images": 2,
+            "max_images_policy": "strip_latest",
+        })
+        msgs = [
+            {"role": "tool", "content": [dict(_TYPICAL_IMAGE_URL)]},
+            {"role": "tool", "content": [dict(_TYPICAL_IMAGE_URL)]},
+            {"role": "tool", "content": [dict(_TYPICAL_IMAGE_URL)]},
+        ]
+        req = MockRequest(messages=msgs)
+        result = await f.process_request(req, _make_context())
+
         assert result.messages[0]["content"][0]["type"] == "image_url"
         assert result.messages[1]["content"][0]["type"] == "image_url"
-        # Most recent (msg[2]) replaced with text placeholder
         assert result.messages[2]["content"][0]["type"] == "text"
-        assert "[Image omitted" in result.messages[2]["content"][0]["text"]
 
     @pytest.mark.asyncio
     async def test_exceeds_limit_multiple_images_per_message(self):
-        """Multiple images in one message → limit enforced per-item."""
+        """Multiple images obey the default newest-images retention policy."""
         f = MultimodalValidatorFilter(config={"max_images": 2})
         msgs = [
             {"role": "tool", "content": [
@@ -540,10 +558,9 @@ class TestMaxImagesEnforcement:
         req = MockRequest(messages=msgs)
         result = await f.process_request(req, _make_context())
         content = result.messages[0]["content"]
-        assert content[0]["type"] == "image_url"
+        assert content[0]["type"] == "text"
         assert content[1]["type"] == "image_url"
-        assert content[2]["type"] == "text"
-        assert "[Image omitted" in content[2]["text"]
+        assert content[2]["type"] == "image_url"
 
     @pytest.mark.asyncio
     async def test_custom_replacement_text(self):
@@ -558,9 +575,9 @@ class TestMaxImagesEnforcement:
         ]
         req = MockRequest(messages=msgs)
         result = await f.process_request(req, _make_context())
-        assert result.messages[0]["content"][0]["type"] == "image_url"
-        assert result.messages[1]["content"][0]["type"] == "text"
-        assert result.messages[1]["content"][0]["text"] == "[skipped]"
+        assert result.messages[0]["content"][0]["type"] == "text"
+        assert result.messages[0]["content"][0]["text"] == "[skipped]"
+        assert result.messages[1]["content"][0]["type"] == "image_url"
 
     @pytest.mark.asyncio
     async def test_mixed_content_preserved(self):
@@ -577,14 +594,13 @@ class TestMaxImagesEnforcement:
         req = MockRequest(messages=msgs)
         result = await f.process_request(req, _make_context())
         content = result.messages[0]["content"]
-        # First image preserved, text items preserved, second image replaced
+        # The most recent image is preserved; text items remain untouched.
         assert content[0]["type"] == "text"
         assert content[0]["text"] == "Result:"
-        assert content[1]["type"] == "image_url"
+        assert content[1]["type"] == "text"
         assert content[2]["type"] == "text"
         assert content[2]["text"] == "End"
-        assert content[3]["type"] == "text"
-        assert "[Image omitted" in content[3]["text"]
+        assert content[3]["type"] == "image_url"
 
     @pytest.mark.asyncio
     async def test_strip_all_images(self):

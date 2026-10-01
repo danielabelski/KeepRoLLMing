@@ -19,7 +19,7 @@ def test_routes_status_endpoint_has_dashboard_shape() -> None:
         assert {
             "name", "upstream_url", "upstream_model", "model_mode",
             "capabilities", "ctx_len", "max_tokens", "activity", "errors",
-            "pending_requests", "active_requests", "performance",
+            "admission", "circuit_breaker", "queued_requests", "pending_requests", "active_requests", "performance",
         } <= route.keys()
         assert len(route["activity"]) == 60
         assert all("requests" in bucket and "minute" in bucket for bucket in route["activity"])

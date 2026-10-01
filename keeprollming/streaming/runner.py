@@ -31,6 +31,7 @@ from .accounting import ExecutionUsage
 from .events import (
     AssistantTextDelta,
     Done,
+    Error,
     Finish,
     ReasoningTextDelta,
     StreamEvent,
@@ -471,7 +472,11 @@ def _collect_finalize_outputs(
             evts = _call_finalize_with_optional_arg(fin, global_attempt_index)
             all_events.append(evts)
             for fe in evts:
-                if isinstance(fe, ToolCallComplete):
+                # A live ToolCallDelta is already a client-visible structured
+                # tool call. The terminal barrier must therefore retain the
+                # same tool_calls finish semantics previously inferred only
+                # from terminal ToolCallComplete output.
+                if isinstance(fe, (ToolCallDelta, ToolCallComplete)):
                     has_tcc = True
         except RuntimeError:
             all_events.append([])
@@ -751,6 +756,25 @@ def _check_recovery_decision_with_fallback(
     # finalizer must never affect that decision.
     for fin in finalizers_by_priority:
         if getattr(fin, "recovery_exhausted", False):
+            # A loop-stopper's replacement is assistant content. Give Nudge
+            # a fresh view of it: rejected tool calls must not suppress lazy
+            # detection. Reset observation only, retaining Nudge's budget.
+            if type(fin).__name__ in {"TLSFinalizer", "RLSFinalizer"}:
+                fallback = getattr(fin, "fallback_message", None) or DEFAULT_FALLBACK_MESSAGE
+                for observer in finalizers_by_priority:
+                    if type(observer).__name__ != "NudgeContinuationFinalizer":
+                        continue
+                    if observer.attempt_index >= observer.max_attempts:
+                        break
+                    observer.reset(preserve_buffer=False, recovery_attempt=False)
+                    observer.process_event(AssistantTextDelta(delta=fallback))
+                    observer.finalize(global_attempt_index)
+                    if observer.decision is not None:
+                        decision = observer.decision
+                        decision.diagnostics["fallback_origin"] = type(fin).__name__
+                        if observer.stream_deltas:
+                            decision.diagnostics["synthetic_prefix"] = fallback
+                        return decision, None
             return None, type(fin).__name__
 
     return None, None
@@ -821,6 +845,7 @@ async def _run_core(
                 type(fin).__name__ == "NudgeContinuationFinalizer"
                 and getattr(fin, "stream_deltas", False)
             )
+            and not getattr(fin, "allows_live_output", False)
             for fin in finalizers_by_priority
         )
     )
@@ -843,6 +868,12 @@ async def _run_core(
                 if not frame.strip():
                     continue
 
+                # The parser records finish_reason out-of-band so usage
+                # arriving in later frames can still be accounted for.  Keep
+                # track of whether this *specific* frame introduced the
+                # terminal barrier: it may also contain the final semantic
+                # delta (notably the closing characters of tool arguments).
+                _finish_reason_before_frame = _pending_finish_reason[0]
                 parsed = _parse_frame_into_events(
                     frame,
                     _pending_content,
@@ -852,17 +883,26 @@ async def _run_core(
                     _pending_finish_reason,
                     _pending_envelope,
                 )
-                # The parser groups deltas and their Finish barrier in one
-                # frame.  Preserve those preceding deltas; only subsequent
-                # frames are post-finish and must be dropped.
-                _finish_in_this_frame = any(isinstance(item, Finish) for item in parsed)
+                # The parser groups deltas and their deferred Finish barrier
+                # in one frame.  Preserve those deltas; only later frames are
+                # post-finish and must be dropped.  ``Finish`` is intentionally
+                # not present in ``parsed`` because its serialization is
+                # delayed for usage parity.
+                _finish_in_this_frame = (
+                    _finish_reason_before_frame is None
+                    and _pending_finish_reason[0] is not None
+                )
 
                 # --- finish_reason barrier (Shape B parity fix) ---
                 # When finish_reason is recorded by the parser, run finalize()
                 # and check for recovery decisions. Finish emission is deferred
                 # to post-loop so that usage arriving after finish_reason is
                 # captured correctly.
-                if _pending_finish_reason[0] is not None and not finish_serialized:
+                if (
+                    _pending_finish_reason[0] is not None
+                    and not finish_serialized
+                    and not _finish_in_this_frame
+                ):
                     # B2 Recovery: collect finalizer output (with merge),
                     # check for recovery decision, then emit if no recovery.
                     _finalizer_output, _tcc_detected = \
@@ -871,8 +911,14 @@ async def _run_core(
                             serializer,
                             global_attempt_index,
                         )
-                    # Track tool_call_complete for finish_reason override
-                    _has_tool_call_complete[0] = _tcc_detected
+                    # Keep the fact that a client-visible tool call was
+                    # already emitted.  In live mode ToolCallDelta instances
+                    # precede the finish barrier, while finalize() correctly
+                    # returns no duplicate ToolCallComplete.  Do not let an
+                    # empty finalizer pass erase that terminal semantic.
+                    _has_tool_call_complete[0] = (
+                        _has_tool_call_complete[0] or _tcc_detected
+                    )
 
                     # B2 Recovery: check if any finalizer requested recovery
                     # C2E: also check for fallback trigger
@@ -885,6 +931,11 @@ async def _run_core(
                         )
 
                     if recovery_decision is not None:
+                        synthetic_prefix = recovery_decision.diagnostics.get("synthetic_prefix")
+                        if synthetic_prefix:
+                            yield serializer.serialize_event(
+                                AssistantTextDelta(delta=synthetic_prefix)
+                            )
                         # O2: emit recovery decision event at finish_reason barrier
                         if _OBSERVABILITY_AVAILABLE and dispatcher is not None:
                             dispatcher.emit(
@@ -1009,6 +1060,24 @@ async def _run_core(
                     if done_serialized:
                         break
 
+                    # Upstreams may send an application error as an SSE
+                    # envelope with HTTP 200.  Propagate it immediately and
+                    # terminate without manufacturing an empty assistant or
+                    # a misleading ``finish_reason=stop``.
+                    if isinstance(event, Error):
+                        _pass_through_buffer.clear()
+                        if execution_usage is not None:
+                            execution_usage.add_attempt(
+                                global_attempt_index, _pending_usage[0]
+                            )
+                            execution_usage.finish_reason = "error"
+                        yield serializer.serialize_event(event)
+                        yield serializer.serialize_event(Done())
+                        finish_serialized = True
+                        done_serialized = True
+                        _done_emitted_synthetic_finish[0] = True
+                        break
+
                     # --- Done: terminal, emit last ---
                     if isinstance(event, Done):
                         # If finish_reason was recorded at barrier but Finish
@@ -1044,7 +1113,7 @@ async def _run_core(
                                 serializer,
                                 global_attempt_index,
                             )
-                            if _has_tcc:
+                            if _has_tool_call_complete[0] or _has_tcc:
                                 _synthetic_reason = "tool_calls"
 
                             # B2 Recovery: check if any finalizer requested recovery
@@ -1059,6 +1128,11 @@ async def _run_core(
                                 )
 
                             if recovery_decision is not None:
+                                synthetic_prefix = recovery_decision.diagnostics.get("synthetic_prefix")
+                                if synthetic_prefix:
+                                    yield serializer.serialize_event(
+                                        AssistantTextDelta(delta=synthetic_prefix)
+                                    )
                                 # O2: emit recovery decision event
                                 if _OBSERVABILITY_AVAILABLE and dispatcher is not None:
                                     dispatcher.emit(
@@ -1221,6 +1295,8 @@ async def _run_core(
                         _finalizers_buffered[0] = True
 
                     for ev in events:
+                        if isinstance(ev, (ToolCallDelta, ToolCallComplete)):
+                            _has_tool_call_complete[0] = True
                         _serialized = serializer.serialize_event(ev)
                         if _recovery_requires_buffering:
                             _pass_through_buffer.append(_serialized)
@@ -1245,6 +1321,8 @@ async def _run_core(
                 if buffered:
                     _finalizers_buffered[0] = True
                 for ev in events:
+                    if isinstance(ev, (ToolCallDelta, ToolCallComplete)):
+                        _has_tool_call_complete[0] = True
                     _serialized = serializer.serialize_event(ev)
                     if _recovery_requires_buffering:
                         _pass_through_buffer.append(_serialized)
@@ -1557,6 +1635,7 @@ def collect_stream_events(
 
     pending: List[StreamEvent] = []
     finish_serialized = False
+    error_serialized = False
 
     for raw_chunk in chunks:
         s = raw_chunk if isinstance(raw_chunk, str) else raw_chunk.decode(
@@ -1580,8 +1659,19 @@ def collect_stream_events(
             # Process events from this frame (including flushed content from
             # finish_reason barrier) before marking finish_serialized.
             for event in parsed_events:
+                # Preserve an upstream error envelope and make it terminal.
+                # Do not append a synthetic Finish after an error.
+                if isinstance(event, Error):
+                    pending.append(event)
+                    pending.append(Done())
+                    finish_serialized = True
+                    error_serialized = True
+                    continue
+
                 # --- Done: terminal ---
                 if isinstance(event, Done):
+                    if error_serialized:
+                        continue
                     pending.append(event)
                     continue
 
@@ -1648,7 +1738,7 @@ def collect_stream_events(
     # Emit Finish with accumulated usage (Shape B parity fix).
     # - If finish_reason was recorded at barrier: use that reason.
     # - If no finish_reason seen (stream exhaustion): use synthetic reason.
-    if not any(isinstance(e, Finish) for e in pending):
+    if not error_serialized and not any(isinstance(e, Finish) for e in pending):
         if _pending_finish_reason[0] is not None:
             _finish_reason = _pending_finish_reason[0]
         else:

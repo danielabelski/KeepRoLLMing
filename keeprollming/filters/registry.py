@@ -11,6 +11,9 @@ from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
 from keeprollming.filters.multimodal_validator import SCHEMA as MULTIMODAL_SCHEMA
+from keeprollming.filters.multimodal_validator import (
+    validate_settings as validate_multimodal_settings,
+)
 from keeprollming.filters.nudge.config import SCHEMA as NUDGE_SCHEMA
 from keeprollming.filters.reasoning_loop_stopper import SCHEMA as RLS_SCHEMA
 from keeprollming.filters.summarization import SCHEMA as SUMMARIZATION_SCHEMA
@@ -83,7 +86,12 @@ def built_in_filter_modules() -> dict[str, FilterModule]:
         "tool_rewrite": (ToolRewriteFilter, 15, TOOL_REWRITE_SCHEMA.fields),
         "reasoning_loop_stopper": (ReasoningLoopStopperFilter, 60, RLS_SCHEMA.fields),
         "model_tool_loop_stopper": (ToolLoopStopperFilter, 55, TLS_SCHEMA.fields),
-        "multimodal_validator": (MultimodalValidatorFilter, None, MULTIMODAL_SCHEMA.fields),
+        "multimodal_validator": (
+            MultimodalValidatorFilter,
+            None,
+            MULTIMODAL_SCHEMA.fields,
+            validate_multimodal_settings,
+        ),
         "model_nudge": (ModelNudgeFilter, 50, NUDGE_SCHEMA.fields),
         "timestamp": (TimestampFilter, 20, TIMESTAMP_SCHEMA.fields),
     }

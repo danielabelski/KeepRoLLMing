@@ -44,6 +44,10 @@ log_payload_max_chars: 20000000
 
 # Logging projections and opt-in raw transport capture.
 observability:
+  # Opt in when operational telemetry must never persist user/model content.
+  # It preserves route/model/timing/usage facts, but omits transcripts,
+  # reasoning, tool payloads and raw transport bytes from every sink.
+  privacy_mode: false
   # Bounded FIFO for optional PLAIN/JSON/server projections. It keeps file
   # writes off streaming requests; overflow is reported as a WARN event.
   projector_queue_size: 2048
@@ -85,6 +89,16 @@ routes:
     summary_enabled: true
     passthrough_enabled: false
     request_timeout: 120
+    # Optional route work governor. With a zero queue timeout, requests beyond
+    # the limit return HTTP 429 immediately; a positive timeout queues only
+    # that long. Omit max_concurrent for the default unlimited behaviour.
+    max_concurrent: 2
+    queue_timeout: 5
+    # Optional upstream health breaker. After three terminal upstream failures
+    # it opens for 60 seconds; a declared fallback model can still be used.
+    circuit_breaker_enabled: true
+    failure_threshold: 3
+    recovery_timeout: 60
     # Static, operator-defined route features. These are inherited by child
     # routes and are exposed by the private GET /routes status endpoint.
     capabilities: ["chat", "streaming", "tools", "reasoning"]
@@ -168,6 +182,8 @@ routes:
         marker_patterns: ["<__media__>", "<image>"]
         log_level: "warning"
         max_images: 4
+        # strip_first retains the newest 4 images; strip_latest retains the oldest 4.
+        max_images_policy: "strip_first"
         max_images_replacement_text: "[image omitted]"
         strip_all_images: false
         strip_last_image_max_retries: 1

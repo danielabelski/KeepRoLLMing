@@ -16,9 +16,15 @@ from fastapi.responses import JSONResponse
 from ..logger import log, extract_last_user_text
 from .. import logger as _logger
 from ..utils.dump import dump_failed_payload
-from ..config import DEFAULTS, resolve_route_settings, UPSTREAM_BASE_URL, resolve_route
-from ..routing import (
+from ..config import (
+    DEFAULTS,
+    UPSTREAM_BASE_URL,
+    USER_ROUTES,
     get_route_settings,
+    resolve_route,
+    resolve_route_settings,
+)
+from ..routing import (
     RoutePlan,
 )
 
@@ -29,7 +35,11 @@ from ..processing import _count_tokens_safe
 from ..observability import events_execution as _exec
 
 # Import streaming handlers
-from .streaming_handlers import process_streaming_request, _strip_last_image_url
+from .streaming_handlers import (
+    _is_terminal_client_http_error,
+    _strip_last_image_url,
+    process_streaming_request,
+)
 
 # Import from summary package (used by this endpoint)
 from ..summary import (
@@ -50,6 +60,15 @@ from ..observability import events_execution as _exec_perf
 summarize_incremental = _rs_summarize_incremental
 
 TOK = TokenCounter()
+
+
+async def _release_admission_after_stream(stream: AsyncIterator[bytes], lease: Any) -> AsyncIterator[bytes]:
+    """Keep an admission lease until the client stream is terminal or closed."""
+    try:
+        async for chunk in stream:
+            yield chunk
+    finally:
+        await lease.release()
 
 
 async def _post_upstream(client, url, *, json, headers, request_timeout: float):
@@ -137,6 +156,26 @@ async def _retry_strip_last_image_non_streaming(
 def _resolve_route_key(route: Any) -> str:
     """Extract route key from route object."""
     return route.name if hasattr(route, 'name') else str(route)
+
+
+def _terminal_upstream_error_response(status_code: int, error_body: str) -> JSONResponse:
+    """Propagate a terminal OpenAI-compatible upstream error unchanged."""
+    try:
+        parsed = json.loads(error_body)
+    except (TypeError, ValueError):
+        parsed = None
+    if isinstance(parsed, dict) and isinstance(parsed.get("error"), dict):
+        return JSONResponse(content=parsed, status_code=status_code)
+    return JSONResponse(
+        {
+            "error": {
+                "message": error_body or f"Upstream returned HTTP {status_code}",
+                "type": "upstream_error",
+                "code": status_code,
+            }
+        },
+        status_code=status_code,
+    )
 
 
 # ── Helper functions for process_chat_request ──────────────────────────────
@@ -246,6 +285,8 @@ def _resolve_route_context(
         context_window=resolved_ctx_len,
         default_max_tokens=resolved_max_tokens,
         upstream_url=route_upstream_url,
+        routes_by_name={candidate.name: candidate for candidate in USER_ROUTES},
+        defaults=DEFAULTS,
     )
     _exec.emit_route_resolved(
         req_id, client_model, route_plan.route_name, model, route_plan.upstream_model,
@@ -351,19 +392,29 @@ def _log_upstream_request(upstream_payload, ctx, did_summarize, req_id):
                         adjusted_max_tokens=upstream_payload.get("max_tokens"))
 
 
+def _runtime_attempt(route, route_name: str, model: str, endpoint_url: str,
+                     request_timeout: float) -> Dict[str, Any]:
+    """Describe an in-flight upstream target without exposing request headers."""
+    return {
+        "route": route_name or getattr(route, "name", ""),
+        "model": model,
+        "endpoint_url": endpoint_url,
+        "request_timeout": request_timeout,
+    }
+
+
 def _setup_fallback(route_plan: RoutePlan, req_id: str):
     """Materialize retry state from the compiled plan, not raw route config."""
     fallback_attempts = []
-    visited_models = {route_plan.settings.upstream_model}
     # Passthrough routes forward directly — no fallback chain
     if route_plan.settings.passthrough_enabled:
-        return fallback_attempts, visited_models
+        return fallback_attempts
     if route_plan.settings.fallback_chain:
         _exec.emit_fallback_chain(
-            req_id, route_plan.settings.fallback_chain, route_plan.settings.upstream_model
+            req_id, route_plan.settings.fallback_chain, route_plan.fallback_attempts,
         )
         fallback_attempts = list(route_plan.fallback_attempts)
-    return fallback_attempts, visited_models
+    return fallback_attempts
 
 
 def _build_pipeline_if_configured(route):
@@ -398,7 +449,11 @@ def _MockResponse_for_pipeline(r=None, *, content=None, model=None, usage=None, 
                 msg_data = choices[0].get("message", {})
                 _content = msg_data.get("content", "") or ""
                 _tool_calls = msg_data.get("tool_calls", [])
-                _reasoning_content = msg_data.get("reasoning_content", "") or ""
+                _reasoning_content = (
+                    msg_data.get("reasoning_content")
+                    or msg_data.get("reasoning")
+                    or ""
+                )
             _usage = resp_json.get("usage")
             _finish_reason = choices[0].get("finish_reason") if choices else None
         except Exception:
@@ -439,16 +494,95 @@ async def process_chat_request(payload, headers, req_id) -> Response | AsyncIter
         )
         return authentication_error_response()
 
+    # Admission happens after authentication but before logging/capture,
+    # filtering, summarization, and upstream allocation.  This makes a busy
+    # route cheap to reject and ensures a streaming slot stays held until the
+    # ASGI body generator is actually closed.
+    from ..admission import get_route_admission_controller
+    from ..app import get_event_dispatcher
+
+    dispatcher = get_event_dispatcher()
+    admission_lease = await get_route_admission_controller().acquire(
+        req_id=req_id,
+        route_name=route.name,
+        max_concurrent=route.max_concurrent,
+        queue_timeout=route.queue_timeout,
+        dispatcher=dispatcher,
+    )
+    if route.max_concurrent is not None and admission_lease is None:
+        return JSONResponse(
+            {
+                "error": {
+                    "message": "Route is at capacity; try again later.",
+                    "type": "route_capacity_exceeded",
+                    "code": "route_capacity_exceeded",
+                }
+            },
+            status_code=429,
+            headers={"Retry-After": "1"},
+        )
+
     _exec.emit_request_start(req_id, stream=payload.get("stream", False))
     t_start = time.perf_counter()
     try:
         user_id, conv_id, client_model, messages, stream, max_tokens_req = _parse_request(payload, headers, req_id)
     except ValueError as e:
+        if admission_lease is not None:
+            await admission_lease.release()
         return JSONResponse({"error": {"message": str(e)}}, status_code=400)
     ctx = _resolve_route_context(
         client_model, messages, payload, max_tokens_req, req_id,
         route=route, model=model,
     )
+
+    from ..circuit_breaker import get_circuit_breaker_registry
+
+    circuit_registry = get_circuit_breaker_registry()
+    circuit_attempt = circuit_registry.allow(
+        route_name=ctx["route"].name,
+        enabled=bool(ctx["route"].circuit_breaker_enabled),
+        recovery_timeout=float(ctx["route"].recovery_timeout),
+        req_id=req_id,
+        dispatcher=dispatcher,
+    )
+    if ctx["route"].circuit_breaker_enabled and circuit_attempt is None:
+        # A configured fallback is still a useful service path when the
+        # primary circuit is open. RoutePlan always includes the primary as
+        # item zero, so subsequent entries are fallback model attempts.
+        fallback_attempts = ctx["route_plan"].fallback_attempts[1:]
+        if fallback_attempts:
+            fallback = fallback_attempts[0]
+            primary = ctx["route_plan"].fallback_attempts[0]
+            _exec.emit_fallback(
+                req_id, primary, fallback,
+                reason="circuit_open", attempt=1,
+                total_attempts=len(ctx["route_plan"].fallback_attempts),
+                dispatcher=dispatcher,
+            )
+            ctx = dict(ctx)
+            ctx["upstream_model"] = fallback.model
+            ctx["url"] = fallback.endpoint_url
+            ctx["request_timeout"] = fallback.request_timeout
+            ctx["route_headers"] = dict(fallback.upstream_headers)
+            circuit_attempt = None
+        else:
+            if admission_lease is not None:
+                await admission_lease.release()
+            return JSONResponse(
+                {"error": {"message": "Upstream route circuit is open; try again later.",
+                           "type": "upstream_unavailable", "code": "circuit_open"}},
+                status_code=503,
+                headers={"Retry-After": str(max(1, int(ctx["route"].recovery_timeout)))},
+            )
+
+    def circuit_success() -> None:
+        circuit_registry.record_success(circuit_attempt, req_id=req_id, dispatcher=dispatcher)
+
+    def circuit_failure() -> None:
+        circuit_registry.record_failure(
+            circuit_attempt, req_id=req_id,
+            failure_threshold=int(ctx["route"].failure_threshold), dispatcher=dispatcher,
+        )
 
     # ── Summarization: V2 Pipeline (non-streaming handled in process_non_streaming_request) ──
     # For streaming: request processing happens in streaming handler
@@ -459,7 +593,6 @@ async def process_chat_request(payload, headers, req_id) -> Response | AsyncIter
                                                 ctx["route_plan"], max_tokens_req, ctx["ctx_eff"], req_id)
 
     # O12: Emit raw request capture event (post-route-resolution, pre-filter-chain)
-    from ..app import get_event_dispatcher
     _exec.emit_request_capture(
         req_id=req_id,
         raw_body=upstream_payload,
@@ -473,20 +606,20 @@ async def process_chat_request(payload, headers, req_id) -> Response | AsyncIter
 
     _log_upstream_request(upstream_payload, ctx, did_summarize, req_id)
     client = await http_client(ctx["request_timeout"])
-    fallback_attempts, visited_models = _setup_fallback(ctx["route_plan"], req_id)
+    fallback_attempts = _setup_fallback(ctx["route_plan"], req_id)
     _exec.emit_request_route(req_id, stream, ctx["route"].name,
                              filters=list(ctx["route_plan"].enabled_filters))
     route_headers = ctx["route_plan"].build_upstream_headers()
     pipeline = ctx["route_plan"].build_pipeline()
     # Phase P5: wire dispatcher through streaming handler call chain
-    from ..app import get_event_dispatcher
     dispatcher = get_event_dispatcher()
     if stream:
-        return process_streaming_request(
+        result = process_streaming_request(
             url=ctx["url"], client=client, payload=upstream_payload,
             route_headers=route_headers, route=ctx["route"], req_id=req_id,
             request_timeout=ctx["request_timeout"], fallback_attempts=fallback_attempts,
-            visited_models=visited_models, upstream_model=ctx["upstream_model"],
+            visited_models=None,
+            upstream_model=ctx["upstream_model"],
             is_passthrough=ctx["is_passthrough"],
             transform_reasoning_content=ctx["transform_reasoning_content"],
             add_empty_content_when_reasoning_only=ctx["add_empty_content_when_reasoning_only"],
@@ -494,16 +627,27 @@ async def process_chat_request(payload, headers, req_id) -> Response | AsyncIter
             pipeline=pipeline,
             enabled_filters=ctx["route_plan"].enabled_filters,
             record_metrics_func=lambda m: _record_final_metrics(m, t_start=t_start, did_summarize=did_summarize, route_name=ctx["route"].name, route=ctx["route"]),
-            dispatcher=dispatcher)
-    else:
-        return await process_non_streaming_request(
+            dispatcher=dispatcher,
+            on_upstream_success=circuit_success,
+            on_upstream_failure=circuit_failure)
+        return _release_admission_after_stream(result, admission_lease) if admission_lease else result
+    try:
+        result = await process_non_streaming_request(
             url=ctx["url"], client=client, payload=upstream_payload,
             route_headers=route_headers, req_id=req_id,
             upstream_model=ctx["upstream_model"], fallback_attempts=fallback_attempts,
-            visited_models=visited_models, t_start=t_start,
+            t_start=t_start,
             did_summarize=did_summarize, route_name=ctx["route"].name, route=ctx["route"],
             pipeline=pipeline, enabled_filters=ctx["route_plan"].enabled_filters,
             request_timeout=ctx["request_timeout"])
+        if result.status_code >= 500:
+            circuit_failure()
+        else:
+            circuit_success()
+        return result
+    finally:
+        if admission_lease is not None:
+            await admission_lease.release()
 
 
 async def process_non_streaming_request(
@@ -513,8 +657,7 @@ async def process_non_streaming_request(
     route_headers: Dict[str, str],
     req_id: str,
     upstream_model: str,
-    fallback_attempts: List[Dict[str, str]],
-    visited_models: Set[str],
+    fallback_attempts: Sequence[Any],
     t_start: float,
     did_summarize: bool = False,
     route_name: str = "",
@@ -522,6 +665,9 @@ async def process_non_streaming_request(
     pipeline=None,
     enabled_filters: Sequence[str] | None = None,
     request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
+    visited_models: Set[str] | None = None,  # legacy caller compatibility
+    fallback_attempt_offset: int = 0,
+    fallback_total_attempts: int | None = None,
 ) -> Response:
     """Process a non-streaming chat completion request.
     
@@ -532,8 +678,7 @@ async def process_non_streaming_request(
         route_headers: Route-specific headers
         req_id: Request ID
         upstream_model: Primary model being used
-        fallback_attempts: List of fallback models to try on failure
-        visited_models: Set of models already attempted
+        fallback_attempts: Fully resolved upstream retry targets.
         t_start: Start timestamp for timing calculations
         did_summarize: Whether summarization was performed
         route_name: Name of the route that handled the request
@@ -570,6 +715,41 @@ async def process_non_streaming_request(
 
     # Reset elapsed timer after filter chain (metrics measure upstream time, not overhead)
     t_start = time.perf_counter()
+    total_attempts = fallback_total_attempts or max(1, len(fallback_attempts))
+    current_attempt: Any = _runtime_attempt(
+        route, route_name, upstream_model, url, request_timeout,
+    )
+
+    async def retry_transport_failure(reason: str, error: BaseException) -> Optional[Response]:
+        """Retry a zero-response failure through the remaining route attempts."""
+        for index, attempt in enumerate(fallback_attempts[1:], start=1):
+            _exec.emit_fallback(
+                req_id, current_attempt, attempt,
+                reason=reason, attempt=fallback_attempt_offset + index,
+                total_attempts=total_attempts, error_type=type(error).__name__,
+                error=str(error),
+            )
+            retry_payload = dict(effective_payload)
+            retry_payload["model"] = attempt.model
+            return await process_non_streaming_request(
+                url=attempt.endpoint_url,
+                client=client,
+                payload=retry_payload,
+                route_headers=dict(attempt.upstream_headers),
+                req_id=req_id,
+                upstream_model=attempt.model,
+                fallback_attempts=list(fallback_attempts[index:]),
+                t_start=t_start,
+                did_summarize=did_summarize,
+                route_name=attempt.route_name,
+                route=attempt.route,
+                pipeline=None,
+                enabled_filters=None,
+                request_timeout=attempt.request_timeout,
+                fallback_attempt_offset=fallback_attempt_offset + index,
+                fallback_total_attempts=total_attempts,
+            )
+        return None
 
     try:
         r = await _post_upstream(client, url, json=effective_payload,
@@ -603,21 +783,61 @@ async def process_non_streaming_request(
             if retry_response is not None:
                 return retry_response
 
-            # Try fallback models
-            for route_opt, fallback_model in fallback_attempts:
-                if fallback_model not in visited_models:
-                    _exec.emit_fallback(req_id, upstream_model, fallback_model)
-                    payload["model"] = fallback_model
-                    visited_models.add(fallback_model)
-                    
-                    try:
-                        r = await _post_upstream(client, url, json=payload,
-                                                 headers=route_headers, request_timeout=request_timeout)
-                        if r.status_code < 400:
-                            break
-                    except Exception:
-                        visited_models.add(fallback_model)
-                        continue
+            # A 400 is a client request error (for example vLLM context
+            # overflow). A fallback cannot repair it, so preserve the actual
+            # upstream envelope instead of masking it behind another model.
+            if _is_terminal_client_http_error(r.status_code):
+                return _terminal_upstream_error_response(r.status_code, err_text)
+
+            # The first compiled attempt is the primary. Each remaining
+            # attempt owns its endpoint, model, headers, and deadline.
+            failure_reason = "http_status"
+            failure_status: int | None = r.status_code
+            failure_error_type: str | None = None
+            failure_error = err_text
+            for index, attempt in enumerate(fallback_attempts[1:], start=1):
+                _exec.emit_fallback(
+                    req_id, current_attempt, attempt,
+                    reason=failure_reason,
+                    attempt=fallback_attempt_offset + index,
+                    total_attempts=total_attempts, status=failure_status,
+                    error_type=failure_error_type, error=failure_error,
+                )
+                retry_payload = dict(effective_payload)
+                retry_payload["model"] = attempt.model
+                # Retain the concrete attempted target for both the next
+                # retry decision and a useful final upstream-error response.
+                upstream_model = attempt.model
+                url = attempt.endpoint_url
+                route_headers = dict(attempt.upstream_headers)
+                request_timeout = attempt.request_timeout
+                current_attempt = attempt
+                try:
+                    r = await _post_upstream(
+                        client, url, json=retry_payload,
+                        headers=route_headers, request_timeout=request_timeout,
+                    )
+                    if r.status_code < 400:
+                        break
+                    err_bytes = await r.aread()
+                    err_text = err_bytes.decode("utf-8", errors="replace")
+                    _exec.emit_upstream_error(
+                        req_id, r.status_code, url, route_name, upstream_model,
+                        err_text, request_payload=retry_payload,
+                    )
+                    failure_reason = "http_status"
+                    failure_status = r.status_code
+                    failure_error_type = None
+                    failure_error = err_text
+                except Exception as exc:
+                    failure_reason = (
+                        "timeout" if isinstance(exc, httpx.TimeoutException)
+                        else "transport_error"
+                    )
+                    failure_status = None
+                    failure_error_type = type(exc).__name__
+                    failure_error = str(exc)
+                    continue
             
             # If still failed, return error response
             if r.status_code >= 400:
@@ -780,7 +1000,11 @@ async def process_non_streaming_request(
                 choices = resp_body.get("choices", [])
                 if choices and isinstance(choices[0], dict):
                     msg_data = choices[0].get("message", {})
-                    reasoning_text = msg_data.get("reasoning_content", "") or ""
+                    reasoning_text = (
+                        msg_data.get("reasoning_content")
+                        or msg_data.get("reasoning")
+                        or ""
+                    )
 
             _exec.emit_assistant(req_id, assistant_text if assistant_text else "",
                                  len(assistant_text), tool_calls=tc_names if tc_names else None,
@@ -831,7 +1055,10 @@ async def process_non_streaming_request(
         except Exception:
             # Fallback: return raw response if JSON parsing fails
             return Response(content=r.content, status_code=r.status_code, media_type="application/json")
-    except httpx.TimeoutException:
+    except httpx.TimeoutException as exc:
+        retry_response = await retry_transport_failure("timeout", exc)
+        if retry_response is not None:
+            return retry_response
         _exec.emit_timeout(req_id)
         # Record metrics even on timeout
         elapsed_ms = (time.perf_counter() - t_start) * 1000.0
@@ -850,6 +1077,9 @@ async def process_non_streaming_request(
         }, t_start=t_start, did_summarize=did_summarize, route_name=route_name, route=route)
         return JSONResponse({"error": {"message": "Request timeout"}}, status_code=504)
     except Exception as e:
+        retry_response = await retry_transport_failure("transport_error", e)
+        if retry_response is not None:
+            return retry_response
         import traceback
         _exec.emit_failed(req_id, str(e), url, route_name, upstream_model,
                           traceback.format_exc())

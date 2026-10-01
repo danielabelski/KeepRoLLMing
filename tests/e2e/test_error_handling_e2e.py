@@ -5,6 +5,7 @@ and concurrent requests.
 """
 
 import asyncio
+import json
 import httpx
 import pytest
 
@@ -73,6 +74,66 @@ class TestErrorHandlingE2E:
         assert resp.status_code in (500, 502), f"Expected 500/502, got {resp.status_code}"
         body = resp.json()
         assert "error" in body
+
+    def test_upstream_500_streaming_returns_upstream_error_not_empty_assistant(
+        self, orchestrator_server, backend_target, backend_client, configure_fake_backend,
+    ):
+        """A pre-stream upstream failure is relayed as a semantic SSE error.
+
+        The downstream HTTP response is already an SSE response by the time
+        the upstream status is observed, so its status can remain 200. The
+        important invariant is that clients receive the actual upstream error
+        and never a synthetic empty assistant response with ``stop``.
+        """
+        configure_fake_backend({
+            "chat": {
+                "script": [{"type": "error", "status": 500, "message": "temporary backend failure"}],
+            }
+        })
+
+        resp = backend_client.post(
+            f"{orchestrator_server.base_url}/v1/chat/completions",
+            json={
+                "model": "local/quick",
+                "messages": [{"role": "user", "content": "test streamed 500"}],
+                "stream": True,
+            },
+        )
+
+        assert resp.status_code == 200
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in resp.text.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        assert events == [{"error": {"message": "temporary backend failure"}}]
+        assert '"finish_reason": "stop"' not in resp.text
+
+    @pytest.mark.asyncio
+    async def test_route_admission_rejects_second_stream_while_first_is_active(
+        self, orchestrator_server, backend_target, configure_fake_backend,
+    ):
+        """A route slot remains held for the complete streaming response."""
+        configure_fake_backend({
+            "chat": {"content": "slow response", "ttft_ms": 750},
+        })
+        url = f"{orchestrator_server.base_url}/v1/chat/completions"
+        payload = {
+            "model": "internal/admission",
+            "messages": [{"role": "user", "content": "hold this route"}],
+            "stream": True,
+        }
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            async with client.stream("POST", url, json=payload) as first:
+                assert first.status_code == 200
+                second = await client.post(url, json=payload)
+                assert second.status_code == 429
+                assert second.json()["error"]["code"] == "route_capacity_exceeded"
+                await first.aread()
+
+            after_release = await client.post(url, json=payload)
+        assert after_release.status_code == 200
 
     def test_empty_messages(self, orchestrator_server, backend_target, backend_client):
         """Empty messages array is handled gracefully."""

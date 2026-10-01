@@ -5,8 +5,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import List
 
-from .formatters import CompactFormatter, JsonFormatter, PlainTextFormatter
+from .formatters import CompactFormatter, Formatter, JsonFormatter, PlainTextFormatter
 from .projectors import Projector, QueuedProjector, RotatingFileSink, StdoutSink
+from .redactor import Redactor, ZeroContentRedactor
 
 DEFAULT_OBSERVABILITY_CONFIG = {
     "json": {
@@ -49,16 +50,37 @@ def _file_sink(log_dir: str, settings: dict) -> RotatingFileSink:
     )
 
 
-def create_default_projectors(log_dir: str = ".", config: dict | None = None) -> List[Projector]:
+class _RedactingFormatter(Formatter):
+    """Apply privacy policy immediately before a formatter projects an event."""
+
+    def __init__(self, formatter: Formatter, redactor: Redactor) -> None:
+        self._formatter = formatter
+        self._redactor = redactor
+
+    def format(self, event) -> str:
+        redact_event = getattr(self._redactor, "redact_event", None)
+        safe_event = redact_event(event) if callable(redact_event) else event
+        return self._formatter.format(safe_event)
+
+
+def create_default_projectors(
+    log_dir: str = ".", config: dict | None = None, *, privacy_mode: bool = False,
+) -> List[Projector]:
     """Create bounded JSON, PLAIN and server projections from configuration."""
     json_settings = _settings(config, "json")
     plain_settings = _settings(config, "plain")
     server_settings = _settings(config, "server")
     projectors: List[Projector] = []
+    redactor: Redactor | None = ZeroContentRedactor() if privacy_mode else None
+
+    def formatter_for(formatter: Formatter) -> Formatter:
+        """Preserve the public formatter contract unless privacy is enabled."""
+        return _RedactingFormatter(formatter, redactor) if redactor is not None else formatter
 
     if json_settings["enabled"]:
         projectors.append(Projector(
-            "structured", level=str(json_settings["level"]), formatter=JsonFormatter(),
+            "structured", level=str(json_settings["level"]),
+            formatter=formatter_for(JsonFormatter()),
             sinks=[_file_sink(log_dir, json_settings)],
         ))
     if plain_settings["enabled"]:
@@ -67,12 +89,13 @@ def create_default_projectors(log_dir: str = ".", config: dict | None = None) ->
             sinks.insert(0, StdoutSink())
         projectors.append(Projector(
             "main", level=str(plain_settings["level"]),
-            formatter=PlainTextFormatter(), sinks=sinks,
+            formatter=formatter_for(PlainTextFormatter()), sinks=sinks,
         ))
     if server_settings["enabled"]:
         projectors.append(Projector(
             "server", selector="execution.performance.request_complete",
-            level=str(server_settings["level"]), formatter=CompactFormatter(),
+            level=str(server_settings["level"]),
+            formatter=formatter_for(CompactFormatter()),
             sinks=[_file_sink(log_dir, server_settings)],
         ))
     return projectors

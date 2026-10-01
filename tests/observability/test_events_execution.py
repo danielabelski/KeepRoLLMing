@@ -146,9 +146,16 @@ class TestConvenienceWrappers:
         assert event.data["did_summarize"] is True
 
     def test_emit_fallback_chain(self):
-        event = emit_fallback_chain("r1", ["model-b"], "model-a")
+        event = emit_fallback_chain(
+            "r1", ["secondary"], [
+                {"route": "primary", "model": "model-a", "endpoint_url": "http://primary/v1/chat/completions", "request_timeout": 30},
+                {"route": "secondary", "model": "model-b", "endpoint_url": "http://secondary/v1/chat/completions", "request_timeout": 45},
+            ],
+        )
         assert event.type == "execution.chat.fallback_chain"
         assert event.data["primary_model"] == "model-a"
+        assert event.data["attempts"][1]["route"] == "secondary"
+        assert event.data["attempts"][1]["timeout_s"] == 45
 
     def test_emit_request_start(self):
         event = emit_request_start("r1", stream=False)
@@ -165,10 +172,23 @@ class TestConvenienceWrappers:
         assert event.level == "ERROR"
 
     def test_emit_fallback(self):
-        event = emit_fallback("r1", "model-a", "model-b")
+        event = emit_fallback(
+            "r1",
+            {
+                "route": "primary", "model": "model-a",
+                "endpoint_url": "http://user:secret@primary/v1/chat/completions?api_key=nope",
+            },
+            {"route": "secondary", "model": "model-b", "endpoint_url": "http://secondary/v1/chat/completions"},
+            reason="http_status", attempt=1, total_attempts=2, status=404,
+            error="model not found",
+        )
         assert event.type == "execution.chat.fallback"
         assert event.data["from_model"] == "model-a"
         assert event.data["to_model"] == "model-b"
+        assert event.data["from_route"] == "primary"
+        assert event.data["to_route"] == "secondary"
+        assert event.data["status"] == 404
+        assert event.data["from_upstream_url"] == "http://primary/v1/chat/completions"
 
     def test_emit_pipeline_error(self):
         event = emit_pipeline_error("r1", "boom")
@@ -273,11 +293,15 @@ class TestDispatcherIntegration:
         emit_route_resolved("r1", "m", "r", "m", "m", "m", False, 0, 0, [], dispatcher=dispatcher)
         emit_override("r1", "k", "old", "new", dispatcher=dispatcher)
         emit_repacked("r1", False, False, "u", 0, None, dispatcher=dispatcher)
-        emit_fallback_chain("r1", [], "m", dispatcher=dispatcher)
+        emit_fallback_chain("r1", [], [], dispatcher=dispatcher)
         emit_request_start("r1", dispatcher=dispatcher)
         emit_request_route("r1", False, "r", [], dispatcher=dispatcher)
         emit_upstream_error("r1", 500, "u", "r", "m", "e", dispatcher=dispatcher)
-        emit_fallback("r1", "a", "b", dispatcher=dispatcher)
+        emit_fallback(
+            "r1", {"route": "a", "model": "a"}, {"route": "b", "model": "b"},
+            reason="transport_error", attempt=1, total_attempts=2,
+            dispatcher=dispatcher,
+        )
         emit_pipeline_error("r1", "e", dispatcher=dispatcher)
         emit_assistant("r1", "", 0, dispatcher=dispatcher)
         emit_http_out("r1", 200, dispatcher=dispatcher)

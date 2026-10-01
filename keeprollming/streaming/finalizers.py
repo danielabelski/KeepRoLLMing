@@ -145,7 +145,9 @@ class ToolCallFinalizer(StreamFinalizer):
     tool-call fragments by index, concatenates arguments in order, and
     emits a single ``ToolCallComplete`` event per index when
     ``finish_reason == "tool_calls"`` is seen (or during ``finalize()``
-    if no Finish event arrives).
+    if no Finish event arrives).  In live-delta mode it keeps the same
+    request-local assembly state but relays native deltas and intentionally
+    does not add a duplicate terminal complete event.
 
     Priority: 40 — runs after timestamp (20) but before nudge (50).
 
@@ -155,6 +157,10 @@ class ToolCallFinalizer(StreamFinalizer):
         If True (default), only emit ToolCallComplete when the
         arguments are valid JSON.  If False, emit regardless and leave
         ``arguments_obj`` as None for invalid JSON.
+    stream_deltas:
+        If True, relay original ToolCallDelta events as they arrive while
+        retaining the internal assembly buffer.  Default False preserves
+        terminal complete-call delivery.
     dispatcher:
         Optional EventDispatcher for observability instrumentation.
     """
@@ -164,10 +170,16 @@ class ToolCallFinalizer(StreamFinalizer):
     def __init__(
         self,
         flush_valid_only: bool = True,
+        stream_deltas: bool = False,
         dispatcher: Any = None,
     ) -> None:
         super().__init__(dispatcher=dispatcher)
         self.flush_valid_only = flush_valid_only
+        # In live delivery mode the finalizer still assembles each call for
+        # validation and internal consumers, but it relays the original
+        # OpenAI-compatible deltas immediately instead of replacing them with
+        # one terminal ToolCallComplete frame.
+        self.stream_deltas = stream_deltas
         # index -> {id, name, arguments (list of fragments)}
         self._buffers: Dict[int, Dict[str, Any]] = {}
         self._flushed: bool = False
@@ -202,7 +214,8 @@ class ToolCallFinalizer(StreamFinalizer):
     def process_event(self, event: StreamEvent) -> list[StreamEvent]:
         """Process a single StreamEvent.
 
-        * ToolCallDelta → buffer, return []
+        * ToolCallDelta → buffer; return [] in terminal-delivery mode or the
+          original delta in live-delivery mode
         * Finish(reason="tool_calls") → flush ToolCallComplete events,
           then return [Finish]
         * Finish(reason="stop") with pending tool calls → flush
@@ -218,7 +231,7 @@ class ToolCallFinalizer(StreamFinalizer):
                 "tool_call_index": event.index,
                 "tool_call_name": event.name or "",
             })
-            return []
+            return [event] if self.stream_deltas else []
 
         if isinstance(event, Finish) and event.reason == "tool_calls":
             complete_events = self._flush_complete()
@@ -270,7 +283,7 @@ class ToolCallFinalizer(StreamFinalizer):
             "pending_buffers": len(self._buffers),
         })
 
-        if not self._buffers:
+        if not self._buffers or self.stream_deltas:
             return []
 
         if self.flush_valid_only:

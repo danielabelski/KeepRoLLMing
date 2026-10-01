@@ -340,6 +340,8 @@ def resolve_inherited_route(route: Route, routes_by_name: Dict[str, Route], visi
             "failure_threshold": route.failure_threshold,
             "recovery_timeout": route.recovery_timeout,
             "request_timeout": route.request_timeout,
+            "max_concurrent": route.max_concurrent,
+            "queue_timeout": route.queue_timeout,
             "cost_priority": route.cost_priority,
             "performance_logs_dir": route.performance_logs_dir,
             "capabilities": route.capabilities,
@@ -409,6 +411,8 @@ def resolve_inherited_route(route: Route, routes_by_name: Dict[str, Route], visi
         "failure_threshold": route.failure_threshold,
         "recovery_timeout": route.recovery_timeout,
         "request_timeout": route.request_timeout,
+        "max_concurrent": route.max_concurrent,
+        "queue_timeout": route.queue_timeout,
         "cost_priority": route.cost_priority,
         "performance_logs_dir": route.performance_logs_dir,
         "capabilities": route.capabilities,
@@ -442,7 +446,7 @@ def resolve_inherited_route(route: Route, routes_by_name: Dict[str, Route], visi
                     "add_empty_content_when_reasoning_only", "reasoning_placeholder_content",
                     "model_pattern", "upstream_url", "upstream_headers", "api_key", "api_keys",
                     "fallback_chain", "circuit_breaker_enabled", "failure_threshold",
-                    "recovery_timeout", "request_timeout", "cost_priority",
+                    "recovery_timeout", "request_timeout", "max_concurrent", "queue_timeout", "cost_priority",
                     "performance_logs_dir", "capabilities", "filters"]:
             own_val = child_own_values[key]          # Child's explicit value (captured before loop)
             parent_val = getattr(resolved_parent, key, None)
@@ -486,8 +490,16 @@ def resolve_inherited_route(route: Route, routes_by_name: Dict[str, Route], visi
         merged_settings["circuit_breaker_enabled"] = apply_default(merged_settings["circuit_breaker_enabled"], False)
         merged_settings["failure_threshold"] = apply_default(merged_settings["failure_threshold"], 3)
         merged_settings["recovery_timeout"] = apply_default(merged_settings["recovery_timeout"], 60)
-        # Use DEFAULTS.request_timeout as the default if provided, otherwise use None to indicate "not set"
-        merged_settings["request_timeout"] = apply_default(merged_settings["request_timeout"], defaults.request_timeout if defaults else 120.0)
+        # Keep the timeout unresolved when no defaults object was supplied.
+        # The application-level RouteSettings resolver then applies the live
+        # root default.  Materializing 120 here would mask
+        # ``default_request_timeout`` for every inherited route.
+        merged_settings["request_timeout"] = apply_default(
+            merged_settings["request_timeout"],
+            defaults.request_timeout if defaults else None,
+        )
+        merged_settings["max_concurrent"] = apply_default(merged_settings["max_concurrent"], None)
+        merged_settings["queue_timeout"] = apply_default(merged_settings["queue_timeout"], None)
         merged_settings["cost_priority"] = apply_default(merged_settings["cost_priority"], 999)
         merged_settings["performance_logs_dir"] = apply_default(merged_settings["performance_logs_dir"], defaults.performance_logs_dir if defaults else "__performance_logs")
 
@@ -497,7 +509,10 @@ def resolve_inherited_route(route: Route, routes_by_name: Dict[str, Route], visi
 def resolve_fallback_chain(
     primary_route: Route,
     primary_backend: str,
-    client_request_id: Optional[str] = None
+    client_request_id: Optional[str] = None,
+    *,
+    routes_by_name: Optional[Dict[str, Route]] = None,
+    defaults: Optional[DefaultSettings] = None,
 ) -> List[Tuple[Route, str]]:
     """
     Resolve a fallback chain for automatic rerouting when backend is unavailable.
@@ -515,7 +530,7 @@ def resolve_fallback_chain(
         Each tuple represents a routing attempt
     """
     attempts = [(primary_route, primary_backend)]
-    visited_models = {primary_backend}  # Track visited models to prevent loops
+    visited_attempts = {(primary_route.name, primary_backend)}
     
     if not primary_route.fallback_chain:
         return attempts
@@ -527,13 +542,27 @@ def resolve_fallback_chain(
         
         # Handle different fallback option formats
         if isinstance(fallback_option, str):
-            # Simple string - could be route name or model name
-            fallback_target = fallback_option
+            # A configured route name is the normal public contract. Resolve
+            # its inheritance so it contributes its own endpoint and model.
+            named_route = (routes_by_name or {}).get(fallback_option)
+            if named_route is not None:
+                resolved_route = resolve_inherited_route(
+                    named_route, routes_by_name or {}, defaults=defaults,
+                )
+                fallback_model = resolved_route.model
+                if not fallback_model:
+                    continue
+                identity = (resolved_route.name, fallback_model)
+                if identity not in visited_attempts:
+                    attempts.append((resolved_route, fallback_model))
+                    visited_attempts.add(identity)
+                continue
 
-            # Use as direct model name (BUILTIN_ROUTES removed in v2)
-            if fallback_target not in visited_models:
-                attempts.append((primary_route, fallback_target))
-                visited_models.add(fallback_target)
+            # Retain direct-model fallback support for existing configurations.
+            identity = (primary_route.name, fallback_option)
+            if identity not in visited_attempts:
+                attempts.append((primary_route, fallback_option))
+                visited_attempts.add(identity)
 
         elif isinstance(fallback_option, dict):
             # Complex option with conditions or metadata
@@ -544,14 +573,20 @@ def resolve_fallback_chain(
                 continue
 
             # For now, always try (condition evaluation can be added later)
-            if target not in visited_models:
+            identity = (primary_route.name, target)
+            if identity not in visited_attempts:
                 attempts.append((primary_route, target))
-                visited_models.add(target)
+                visited_attempts.add(identity)
     
     return attempts
 
 
-def get_route_settings(route: Route, model: str) -> "RouteSettings":
+def get_route_settings(
+    route: Route,
+    model: str,
+    *,
+    defaults: DefaultSettings | None = None,
+) -> "RouteSettings":
     """
     Extract all settings from a matched route as a typed RouteSettings object.
 
@@ -560,10 +595,14 @@ def get_route_settings(route: Route, model: str) -> "RouteSettings":
         model: The resolved model name
 
     Returns:
-        RouteSettings object with all defaults applied
+        RouteSettings object with all defaults applied when ``defaults`` is
+        supplied.  Callers outside the loaded application configuration may
+        omit it and retain the standalone defaults used by ``from_route``.
     """
     from ..core.config_types import RouteSettings
 
+    if defaults is not None:
+        return RouteSettings.resolve(route, defaults, model)
     return RouteSettings.from_route(route, model)
 
 
